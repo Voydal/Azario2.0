@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/parking-domain",
+    "services/parking-api",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+axum = "0.8"
+chrono = "0.4"
+tokio = "1"
+uuid = "1"
