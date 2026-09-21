@@ -1,0 +1,13 @@
+[package]
+name = "camera-simulator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-nats = { workspace = true }
+chrono = { workspace = true }
+parking-events = { path = "../../crates/parking-events" }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+uuid = { workspace = true }

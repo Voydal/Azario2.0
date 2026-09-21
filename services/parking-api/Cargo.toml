@@ -6,5 +6,9 @@ license.workspace = true
 
 [dependencies]
 axum = { workspace = true }
+chrono = { workspace = true }
 parking-domain = { path = "../../crates/parking-domain" }
+parking-persistence = { path = "../../crates/parking-persistence" }
+serde = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
+uuid = { workspace = true }

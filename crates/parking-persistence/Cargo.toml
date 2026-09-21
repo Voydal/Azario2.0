@@ -1,0 +1,14 @@
+[package]
+name = "parking-persistence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono = { workspace = true }
+parking-domain = { path = "../parking-domain" }
+sqlx = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

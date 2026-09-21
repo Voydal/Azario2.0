@@ -1,0 +1,19 @@
+[package]
+name = "parking-ingestion-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-nats = { workspace = true }
+futures-util = { workspace = true }
+parking-domain = { path = "../../crates/parking-domain" }
+parking-events = { path = "../../crates/parking-events" }
+parking-persistence = { path = "../../crates/parking-persistence" }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+
+[dev-dependencies]
+chrono = { workspace = true }
+sqlx = { workspace = true }
+uuid = { workspace = true }
