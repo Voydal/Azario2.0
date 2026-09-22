@@ -14,4 +14,5 @@ parking-search = { path = "../../crates/parking-search" }
 reqwest = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
+tower-http = { workspace = true }
 uuid = { workspace = true }

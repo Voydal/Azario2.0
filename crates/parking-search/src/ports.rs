@@ -35,6 +35,14 @@ pub struct RouteMatrixEntry {
     pub status: MatrixElementStatus,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WalkingRouteMatrixEntry {
+    pub origin_index: usize,
+    pub distance_m: u64,
+    pub duration_s: u64,
+    pub status: MatrixElementStatus,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExternalServiceError {
     Timeout,
@@ -84,6 +92,12 @@ pub trait RouteMatrixProvider: Send + Sync {
         origin: Coordinate,
         destinations: &[Coordinate],
     ) -> Result<Vec<RouteMatrixEntry>, ExternalServiceError>;
+
+    async fn walking_costs(
+        &self,
+        origins: &[Coordinate],
+        destination: Coordinate,
+    ) -> Result<Vec<WalkingRouteMatrixEntry>, ExternalServiceError>;
 }
 
 #[async_trait]

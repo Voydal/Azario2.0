@@ -3,7 +3,7 @@ use std::{env, net::SocketAddr, sync::Arc, time::Duration as StdDuration};
 use axum::{
     Json, Router,
     extract::{Query, State, rejection::JsonRejection},
-    http::StatusCode,
+    http::{HeaderValue, Method, StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -19,6 +19,7 @@ use parking_search::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
+use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
 const MAX_SEARCH_RADIUS_METERS: f64 = 5_000.0;
@@ -34,6 +35,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let repository = ParkingRepository::connect(&database_url).await?;
     repository.migrate().await?;
     let parking_search = build_parking_search(&repository)?;
+    let frontend_origin = env::var("FRONTEND_ORIGIN")
+        .unwrap_or_else(|_| "http://localhost:5173".into())
+        .parse::<HeaderValue>()?;
 
     let address = SocketAddr::from(([0, 0, 0, 0], 3000));
     let listener = TcpListener::bind(address).await?;
@@ -41,10 +45,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("parking-api listening on http://{address}");
     axum::serve(
         listener,
-        app(AppState {
-            repository,
-            parking_search,
-        }),
+        app(
+            AppState {
+                repository,
+                parking_search,
+            },
+            frontend_origin,
+        ),
     )
     .await?;
     Ok(())
@@ -56,7 +63,7 @@ struct AppState {
     parking_search: Option<Arc<FindParking>>,
 }
 
-fn app(state: AppState) -> Router {
+fn app(state: AppState, frontend_origin: HeaderValue) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/parking-spots", post(create_parking_spot))
@@ -64,6 +71,12 @@ fn app(state: AppState) -> Router {
         .route("/v1/parking-spots/free", get(find_free_parking_spots))
         .route("/v1/parking/search", post(find_parking))
         .with_state(state)
+        .layer(
+            CorsLayer::new()
+                .allow_origin(frontend_origin)
+                .allow_methods([Method::GET, Method::POST])
+                .allow_headers([CONTENT_TYPE]),
+        )
 }
 
 fn build_parking_search(
@@ -241,7 +254,7 @@ async fn find_parking(
             StatusCode::OK,
             Json(FindParkingResponse::from_result(
                 payload.destination_address,
-                result,
+                *result,
             )),
         )
             .into_response()),
@@ -383,7 +396,9 @@ struct FindParkingResponse {
     destination: DestinationResponse,
     parking_spot: SelectedParkingSpotResponse,
     ranking: RankingResponse,
+    walk: WalkResponse,
     route: RouteResponse,
+    warnings: Vec<WarningResponse>,
 }
 
 impl FindParkingResponse {
@@ -405,16 +420,22 @@ impl FindParkingResponse {
             },
             ranking: RankingResponse {
                 driving_duration_s: result.ranking.drive_duration_s,
-                driving_distance_m: result.ranking.drive_distance_m,
-                walking_proxy_distance_m: result.spot.distance_to_destination_m,
-                walking_proxy_duration_s: result.ranking.walking_proxy_seconds,
-                score_s: result.ranking.score,
+                walking_duration_s: result.ranking.walking_duration_s,
+                score_s: result.ranking.score_s,
+            },
+            walk: WalkResponse {
+                distance_m: result.walk.distance_m,
+                duration_s: result.walk.duration_s,
             },
             route: RouteResponse {
                 distance_m: result.route.distance_m,
                 duration_s: result.route.duration_s,
                 encoded_polyline: result.route.encoded_polyline,
             },
+            warnings: vec![WarningResponse {
+                code: "walking_routes_beta",
+                message: "Walking routes are beta and may not always include clear pedestrian paths.",
+            }],
         }
     }
 }
@@ -440,10 +461,14 @@ struct SelectedParkingSpotResponse {
 #[derive(Serialize)]
 struct RankingResponse {
     driving_duration_s: u64,
-    driving_distance_m: u64,
-    walking_proxy_distance_m: f64,
-    walking_proxy_duration_s: f64,
-    score_s: f64,
+    walking_duration_s: u64,
+    score_s: u64,
+}
+
+#[derive(Serialize)]
+struct WalkResponse {
+    distance_m: u64,
+    duration_s: u64,
 }
 
 #[derive(Serialize)]
@@ -451,6 +476,12 @@ struct RouteResponse {
     distance_m: u64,
     duration_s: u64,
     encoded_polyline: String,
+}
+
+#[derive(Serialize)]
+struct WarningResponse {
+    code: &'static str,
+    message: &'static str,
 }
 
 #[derive(Serialize)]

@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use parking_search::{
     Coordinate, DrivingRoute, ExternalServiceError, GeocodedLocation, Geocoder,
     MatrixElementStatus, RouteMatrixEntry, RouteMatrixProvider, RouteProvider,
+    WalkingRouteMatrixEntry,
 };
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
@@ -67,6 +68,38 @@ impl GoogleMapsClient {
             .header("X-Goog-Api-Key", &self.api_key)
             .header("X-Goog-FieldMask", field_mask)
     }
+
+    async fn matrix_elements(
+        &self,
+        origins: &[Coordinate],
+        destinations: &[Coordinate],
+        travel_mode: &'static str,
+        routing_preference: Option<&'static str>,
+    ) -> Result<Vec<MatrixResponseElement>, ExternalServiceError> {
+        let request = MatrixRequest {
+            origins: origins.iter().copied().map(MatrixWaypoint::new).collect(),
+            destinations: destinations
+                .iter()
+                .copied()
+                .map(MatrixWaypoint::new)
+                .collect(),
+            travel_mode,
+            routing_preference,
+        };
+        let url = Url::parse(&self.route_matrix_endpoint)
+            .map_err(|_| ExternalServiceError::MalformedResponse)?;
+        let response = self
+            .request(reqwest::Method::POST, url, ROUTE_MATRIX_FIELD_MASK)
+            .json(&request)
+            .send()
+            .await
+            .map_err(map_reqwest_error)?;
+        let response = checked_response(response)?;
+        response
+            .json()
+            .await
+            .map_err(|_| ExternalServiceError::MalformedResponse)
+    }
 }
 
 #[async_trait]
@@ -116,29 +149,9 @@ impl RouteMatrixProvider for GoogleMapsClient {
         origin: Coordinate,
         destinations: &[Coordinate],
     ) -> Result<Vec<RouteMatrixEntry>, ExternalServiceError> {
-        let request = MatrixRequest {
-            origins: vec![MatrixWaypoint::new(origin)],
-            destinations: destinations
-                .iter()
-                .copied()
-                .map(MatrixWaypoint::new)
-                .collect(),
-            travel_mode: "DRIVE",
-            routing_preference: "TRAFFIC_AWARE",
-        };
-        let url = Url::parse(&self.route_matrix_endpoint)
-            .map_err(|_| ExternalServiceError::MalformedResponse)?;
-        let response = self
-            .request(reqwest::Method::POST, url, ROUTE_MATRIX_FIELD_MASK)
-            .json(&request)
-            .send()
-            .await
-            .map_err(map_reqwest_error)?;
-        let response = checked_response(response)?;
-        let elements: Vec<MatrixResponseElement> = response
-            .json()
-            .await
-            .map_err(|_| ExternalServiceError::MalformedResponse)?;
+        let elements = self
+            .matrix_elements(&[origin], destinations, "DRIVE", Some("TRAFFIC_AWARE"))
+            .await?;
 
         let mut seen_destinations = vec![false; destinations.len()];
         elements
@@ -163,6 +176,52 @@ impl RouteMatrixProvider for GoogleMapsClient {
                 }
                 Ok(RouteMatrixEntry {
                     destination_index: element.destination_index,
+                    distance_m: element
+                        .distance_meters
+                        .ok_or(ExternalServiceError::MalformedResponse)?,
+                    duration_s: parse_duration(
+                        element
+                            .duration
+                            .as_deref()
+                            .ok_or(ExternalServiceError::MalformedResponse)?,
+                    )?,
+                    status: MatrixElementStatus::Reachable,
+                })
+            })
+            .collect()
+    }
+
+    async fn walking_costs(
+        &self,
+        origins: &[Coordinate],
+        destination: Coordinate,
+    ) -> Result<Vec<WalkingRouteMatrixEntry>, ExternalServiceError> {
+        let elements = self
+            .matrix_elements(origins, &[destination], "WALK", None)
+            .await?;
+        let mut seen_origins = vec![false; origins.len()];
+        elements
+            .into_iter()
+            .map(|element| {
+                if element.destination_index != 0 || element.origin_index >= origins.len() {
+                    return Err(ExternalServiceError::MalformedResponse);
+                }
+                if seen_origins[element.origin_index] {
+                    return Err(ExternalServiceError::MalformedResponse);
+                }
+                seen_origins[element.origin_index] = true;
+                let reachable = element.status.code.unwrap_or(0) == 0
+                    && element.condition.as_deref() == Some("ROUTE_EXISTS");
+                if !reachable {
+                    return Ok(WalkingRouteMatrixEntry {
+                        origin_index: element.origin_index,
+                        distance_m: 0,
+                        duration_s: 0,
+                        status: MatrixElementStatus::Unreachable,
+                    });
+                }
+                Ok(WalkingRouteMatrixEntry {
+                    origin_index: element.origin_index,
                     distance_m: element
                         .distance_meters
                         .ok_or(ExternalServiceError::MalformedResponse)?,
@@ -279,7 +338,8 @@ struct MatrixRequest {
     origins: Vec<MatrixWaypoint>,
     destinations: Vec<MatrixWaypoint>,
     travel_mode: &'static str,
-    routing_preference: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    routing_preference: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -327,7 +387,9 @@ struct MatrixResponseElement {
     condition: Option<String>,
     distance_meters: Option<u64>,
     duration: Option<String>,
+    #[serde(default)]
     origin_index: usize,
+    #[serde(default)]
     destination_index: usize,
 }
 
@@ -384,7 +446,7 @@ mod tests {
             "secret-key".into(),
             timeout,
             format!("{}/geocode/address/", server.uri()),
-            format!("{}/matrix", server.uri()),
+            format!("{}/distanceMatrix/v2:computeRouteMatrix", server.uri()),
             format!("{}/routes", server.uri()),
         )
         .unwrap()
@@ -456,10 +518,10 @@ mod tests {
     async fn matrix_maps_success_and_per_element_failure() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/matrix"))
+            .and(path("/distanceMatrix/v2:computeRouteMatrix"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-                {"originIndex": 0, "destinationIndex": 0, "status": {}, "condition": "ROUTE_EXISTS", "distanceMeters": 1200, "duration": "275s"},
-                {"originIndex": 0, "destinationIndex": 1, "status": {"code": 5}, "condition": "ROUTE_NOT_FOUND"}
+                {"status": {}, "condition": "ROUTE_EXISTS", "distanceMeters": 1200, "duration": "275s"},
+                {"destinationIndex": 1, "status": {"code": 5}, "condition": "ROUTE_NOT_FOUND"}
             ])))
             .mount(&server)
             .await;
@@ -482,6 +544,90 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(body["travelMode"], "DRIVE");
         assert_eq!(body["routingPreference"], "TRAFFIC_AWARE");
+    }
+
+    #[tokio::test]
+    async fn walking_route_matrix_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/distanceMatrix/v2:computeRouteMatrix"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"originIndex": 1, "status": {}, "condition": "ROUTE_EXISTS", "distanceMeters": 400, "duration": "300s"},
+                {"status": {}, "condition": "ROUTE_EXISTS", "distanceMeters": 200, "duration": "150s"}
+            ])))
+            .mount(&server)
+            .await;
+        let entries = client(&server, Duration::from_secs(1))
+            .await
+            .walking_costs(
+                &[coordinate(52.1, 21.1), coordinate(52.2, 21.2)],
+                coordinate(52.3, 21.3),
+            )
+            .await
+            .unwrap();
+        assert_eq!(entries[0].origin_index, 1);
+        assert_eq!(entries[0].distance_m, 400);
+        assert_eq!(entries[0].duration_s, 300);
+        assert_eq!(entries[0].status, MatrixElementStatus::Reachable);
+        assert_eq!(entries[1].origin_index, 0);
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests[0].headers.get("x-goog-fieldmask").unwrap(),
+            ROUTE_MATRIX_FIELD_MASK
+        );
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["travelMode"], "WALK");
+        assert!(body.get("routingPreference").is_none());
+        assert_eq!(body["origins"].as_array().unwrap().len(), 2);
+        assert_eq!(body["destinations"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn walking_route_matrix_handles_per_element_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/distanceMatrix/v2:computeRouteMatrix"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"originIndex": 0, "destinationIndex": 0, "status": {}, "condition": "ROUTE_EXISTS", "distanceMeters": 200, "duration": "150s"},
+                {"originIndex": 1, "destinationIndex": 0, "status": {"code": 5}, "condition": "ROUTE_NOT_FOUND"}
+            ])))
+            .mount(&server)
+            .await;
+        let entries = client(&server, Duration::from_secs(1))
+            .await
+            .walking_costs(
+                &[coordinate(52.1, 21.1), coordinate(52.2, 21.2)],
+                coordinate(52.3, 21.3),
+            )
+            .await
+            .unwrap();
+        assert_eq!(entries[0].status, MatrixElementStatus::Reachable);
+        assert_eq!(entries[1].status, MatrixElementStatus::Unreachable);
+    }
+
+    #[tokio::test]
+    async fn malformed_walking_duration_is_reported() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/distanceMatrix/v2:computeRouteMatrix"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+                "originIndex": 0,
+                "destinationIndex": 0,
+                "status": {},
+                "condition": "ROUTE_EXISTS",
+                "distanceMeters": 200,
+                "duration": "banana"
+            }])))
+            .mount(&server)
+            .await;
+        assert_eq!(
+            client(&server, Duration::from_secs(1))
+                .await
+                .walking_costs(&[coordinate(52.1, 21.1)], coordinate(52.3, 21.3))
+                .await,
+            Err(ExternalServiceError::MalformedResponse)
+        );
     }
 
     #[tokio::test]
@@ -591,7 +737,7 @@ mod tests {
     async fn matrix_rejects_out_of_range_destination_index() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/matrix"))
+            .and(path("/distanceMatrix/v2:computeRouteMatrix"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
                 "originIndex": 0,
                 "destinationIndex": 1,

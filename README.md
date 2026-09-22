@@ -14,6 +14,7 @@ docker compose up -d
 docker compose ps
 export DATABASE_URL=postgres://parking:parking@localhost:5432/parking
 export NATS_URL=nats://127.0.0.1:4222
+export FRONTEND_ORIGIN=http://localhost:5173
 cargo run -p parking-api
 ```
 
@@ -152,9 +153,20 @@ PostGIS: świeże i wolne miejsca w promieniu
         |
         v
 Routes API v2: Compute Route Matrix
+DRIVE: pozycja pojazdu -> miejsca
         |
         v
-ranking
+odrzucenie miejsc niedostępnych samochodem
+        |
+        v
+Routes API v2: Compute Route Matrix
+WALK: dostępne miejsca -> cel
+        |
+        v
+odrzucenie miejsc niedostępnych pieszo
+        |
+        v
+ranking DRIVE + WALK
         |
         v
 Routes API v2: Compute Routes dla zwycięzcy
@@ -164,19 +176,29 @@ odpowiedź z ETA i encoded polyline
 ```
 
 PostGIS ogranicza liczbę płatnych elementów macierzy przed wywołaniem Google. Dla jednego
-wyszukiwania wykonywane jest najwyżej jedno wywołanie Route Matrix oraz jedno Compute Routes.
+wyszukiwania wykonywane są najwyżej dwa wywołania Route Matrix (jedno DRIVE i jedno WALK)
+oraz jedno Compute Routes DRIVE dla zwycięzcy.
 Wynik geokodowania z wieloma dopasowaniami używa pierwszego wyniku; interaktywne ujednoznacznianie
 adresu nie należy jeszcze do tego etapu.
 
-Ranking używa przybliżenia marszu z prędkością 1,4 m/s:
+Walking proxy oparty na odległości w linii prostej został usunięty z rankingu. Czas marszu
+pochodzi z rzeczywistej macierzy Google z `travelMode=WALK`. Ranking wynosi:
 
 ```text
-walking_proxy_seconds = distance_to_destination_m / 1.4
-score_s = driving_duration_s + walking_proxy_seconds
+score_s = driving_duration_s + walking_duration_s
 ```
 
-Remisy rozstrzygają kolejno: niższy score, mniejsza odległość miejsca od celu, krótszy czas
-dojazdu i na końcu stabilne sortowanie po identyfikatorze miejsca.
+Remisy rozstrzygają kolejno: krótszy rzeczywisty czas marszu, mniejsza odległość miejsca od celu
+według PostGIS, krótszy czas dojazdu i na końcu stabilne sortowanie po identyfikatorze miejsca.
+
+Przy `N` kandydatach macierz DRIVE zawiera maksymalnie `N` elementów, a macierz WALK maksymalnie
+kolejne `N`. WALK jest wywoływany dopiero po odrzuceniu miejsc niedostępnych samochodem, więc
+rzeczywista liczba elementów może być mniejsza. Domyślny limit 25 oznacza najwyżej 50 elementów
+obu macierzy łącznie, bez wykonywania osobnego requestu dla każdego miejsca.
+
+Google oznacza walking routes jako funkcję beta. Odpowiedź sukcesu zawiera ostrzeżenie
+`walking_routes_beta`; przyszły frontend prezentujący trasę pieszą musi poinformować użytkownika,
+że dane mogą nie obejmować wszystkich chodników i ścieżek pieszych.
 
 Manualny test wymaga działającej infrastruktury, świeżej obserwacji `free` oraz prawdziwego klucza
 z włączonymi Geocoding API v4 i Routes API:
@@ -193,6 +215,63 @@ curl -i -X POST http://127.0.0.1:3000/v1/parking/search \
 Serwer używa klucza tylko w nagłówku `X-Goog-Api-Key`. Nie przekazuj go w URL ani nie commituj
 plików `.env`; są ignorowane przez Git.
 
+## Frontend webowy
+
+Frontend React/TypeScript znajduje się w `web/`. Routing pozostaje wyłącznie w backendzie:
+przeglądarka renderuje otrzymane markery i encoded driving polyline, ale nie wywołuje Route Matrix,
+Compute Routes ani Directions Service.
+
+```text
+SearchForm
+  -> parkingApi
+  -> POST /v1/parking/search
+  -> SearchResult
+  -> ParkingMap
+```
+
+Konfiguracja developerska:
+
+```bash
+cd web
+npm install
+cp .env.example .env.local
+
+export VITE_GOOGLE_MAPS_API_KEY='browser-key'
+export VITE_GOOGLE_MAP_ID=DEMO_MAP_ID
+export VITE_PARKING_API_BASE_URL=http://127.0.0.1:3000
+npm run dev
+```
+
+Aplikacja będzie dostępna pod `http://localhost:5173`. Backend powinien być uruchomiony z:
+
+```bash
+export FRONTEND_ORIGIN=http://localhost:5173
+```
+
+`GOOGLE_MAPS_API_KEY` jest sekretem serwerowym używanym przez Geocoding i Routes API — nigdy nie
+jest przekazywany do przeglądarki. `VITE_GOOGLE_MAPS_API_KEY` jest publicznym kluczem przeglądarkowym
+dla Maps JavaScript API. Należy ograniczyć go w Google Cloud wyłącznie do Maps JavaScript API oraz
+ustawić HTTP referrer restrictions dla rzeczywistych domen frontendu. Nie commituj `.env.local` ani
+żadnego prawdziwego klucza.
+
+Advanced Markers wymagają map ID. `DEMO_MAP_ID` służy wyłącznie do developmentu; środowisko
+produkcyjne powinno podawać własne `VITE_GOOGLE_MAP_ID`. Frontend ładuje tylko biblioteki `maps`,
+`marker` i `geometry`. Brak klucza albo błąd Maps JavaScript API nie blokuje formularza ani tekstowego
+wyniku — zamiast mapy pojawia się kontrolowany komunikat.
+
+Manualny smoke test:
+
+1. Uruchom PostGIS/NATS, backend z oboma zmiennymi `GOOGLE_MAPS_API_KEY` i `FRONTEND_ORIGIN`,
+   a następnie frontend z powyższymi zmiennymi `VITE_*`.
+2. Otwórz `http://localhost:5173`.
+3. Kliknij `Use my location` albo wpisz współrzędne ręcznie, podaj adres i wyszukaj parking.
+4. Sprawdź markery origin/destination/parking, trasę DRIVE, podsumowanie DRIVE/WALK i ostrzeżenie
+   `walking_routes_beta`.
+5. Wykonaj drugi search i sprawdź, że markery oraz polilinia zostały zastąpione.
+
+Google walking routes pozostają beta. Każdy klient prezentujący ich wynik musi pokazać zwrócone
+przez backend ostrzeżenie o możliwych brakach chodników i ścieżek pieszych.
+
 ## Testy i kontrola jakości
 
 PostGIS i NATS z Compose muszą działać. Testy integracyjne wykonują prawdziwe zapytania do
@@ -204,6 +283,11 @@ export NATS_URL=nats://127.0.0.1:4222
 cargo fmt --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
+
+cd web
+npm run lint
+npm test
+npm run build
 ```
 
 ## Założenie MVP

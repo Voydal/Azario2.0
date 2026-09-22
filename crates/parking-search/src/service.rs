@@ -6,10 +6,9 @@ use parking_domain::ParkingSpotId;
 use crate::{
     Coordinate, ExternalServiceError, GeocodedLocation, Geocoder, MatrixElementStatus,
     ParkingCandidate, ParkingCandidateRepository, ParkingRepositoryError, RouteMatrixEntry,
-    RouteMatrixProvider, RouteProvider,
+    RouteMatrixProvider, RouteProvider, WalkingRouteMatrixEntry,
 };
 
-const WALKING_SPEED_METERS_PER_SECOND: f64 = 1.4;
 pub const DEFAULT_OBSERVATION_TTL: Duration = Duration::seconds(15);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,8 +28,14 @@ pub struct DrivingRoute {
 pub struct RankingDetails {
     pub drive_duration_s: u64,
     pub drive_distance_m: u64,
-    pub walking_proxy_seconds: f64,
-    pub score: f64,
+    pub walking_duration_s: u64,
+    pub score_s: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WalkingRoute {
+    pub distance_m: u64,
+    pub duration_s: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -46,12 +51,13 @@ pub struct ParkingSearchResult {
     pub destination: GeocodedLocation,
     pub spot: SelectedParkingSpot,
     pub ranking: RankingDetails,
+    pub walk: WalkingRoute,
     pub route: DrivingRoute,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum FindParkingOutcome {
-    Found(ParkingSearchResult),
+    Found(Box<ParkingSearchResult>),
     NoCandidates,
     NoReachableParking,
 }
@@ -151,63 +157,127 @@ impl FindParking {
             .await
             .map_err(FindParkingError::External)?;
 
-        let Some((candidate, ranking)) = select_best_candidate(&candidates, &matrix) else {
+        let driving_candidates = driving_reachable_candidates(&candidates, &matrix);
+        if driving_candidates.is_empty() {
+            return Ok(FindParkingOutcome::NoReachableParking);
+        }
+
+        let walking_origins: Vec<_> = driving_candidates
+            .iter()
+            .map(|candidate| candidate.candidate.coordinates)
+            .collect();
+        let walking_matrix = self
+            .matrix_provider
+            .walking_costs(&walking_origins, destination.coordinates)
+            .await
+            .map_err(FindParkingError::External)?;
+
+        let Some((candidate, ranking, walk)) =
+            select_best_candidate(&driving_candidates, &walking_matrix)
+        else {
             return Ok(FindParkingOutcome::NoReachableParking);
         };
         let route = self
             .route_provider
-            .driving_route(origin, candidate.coordinates)
+            .driving_route(origin, candidate.candidate.coordinates)
             .await
             .map_err(FindParkingError::External)?;
 
-        Ok(FindParkingOutcome::Found(ParkingSearchResult {
+        Ok(FindParkingOutcome::Found(Box::new(ParkingSearchResult {
             destination,
             spot: SelectedParkingSpot {
-                spot_id: candidate.spot_id,
-                coordinates: candidate.coordinates,
-                observed_at: candidate.observed_at,
-                distance_to_destination_m: candidate.distance_to_destination_m,
+                spot_id: candidate.candidate.spot_id,
+                coordinates: candidate.candidate.coordinates,
+                observed_at: candidate.candidate.observed_at,
+                distance_to_destination_m: candidate.candidate.distance_to_destination_m,
             },
             ranking,
+            walk,
             route,
-        }))
+        })))
     }
 }
 
-fn select_best_candidate<'a>(
+#[derive(Clone, Copy)]
+struct DrivingCandidate<'a> {
+    candidate: &'a ParkingCandidate,
+    route: RouteMatrixEntry,
+}
+
+fn driving_reachable_candidates<'a>(
     candidates: &'a [ParkingCandidate],
     matrix: &[RouteMatrixEntry],
-) -> Option<(&'a ParkingCandidate, RankingDetails)> {
-    matrix
+) -> Vec<DrivingCandidate<'a>> {
+    let mut routes = vec![None; candidates.len()];
+    for entry in matrix
         .iter()
         .filter(|entry| entry.status == MatrixElementStatus::Reachable)
-        .filter_map(|entry| {
-            let candidate = candidates.get(entry.destination_index)?;
-            let walking_proxy_seconds =
-                candidate.distance_to_destination_m / WALKING_SPEED_METERS_PER_SECOND;
+    {
+        if let Some(route) = routes.get_mut(entry.destination_index) {
+            *route = Some(*entry);
+        }
+    }
+
+    candidates
+        .iter()
+        .zip(routes)
+        .filter_map(|(candidate, route)| route.map(|route| DrivingCandidate { candidate, route }))
+        .collect()
+}
+
+fn select_best_candidate<'a>(
+    candidates: &'a [DrivingCandidate<'a>],
+    walking_matrix: &[WalkingRouteMatrixEntry],
+) -> Option<(&'a DrivingCandidate<'a>, RankingDetails, WalkingRoute)> {
+    let mut routes = vec![None; candidates.len()];
+    for entry in walking_matrix
+        .iter()
+        .filter(|entry| entry.status == MatrixElementStatus::Reachable)
+    {
+        if let Some(route) = routes.get_mut(entry.origin_index) {
+            *route = Some(*entry);
+        }
+    }
+
+    candidates
+        .iter()
+        .zip(routes)
+        .filter_map(|(candidate, walking)| {
+            let walking = walking?;
+            let score_s = candidate.route.duration_s.checked_add(walking.duration_s)?;
             let ranking = RankingDetails {
-                drive_duration_s: entry.duration_s,
-                drive_distance_m: entry.distance_m,
-                walking_proxy_seconds,
-                score: entry.duration_s as f64 + walking_proxy_seconds,
+                drive_duration_s: candidate.route.duration_s,
+                drive_distance_m: candidate.route.distance_m,
+                walking_duration_s: walking.duration_s,
+                score_s,
             };
-            Some((candidate, ranking))
+            Some((
+                candidate,
+                ranking,
+                WalkingRoute {
+                    distance_m: walking.distance_m,
+                    duration_s: walking.duration_s,
+                },
+            ))
         })
-        .min_by(|(left_candidate, left), (right_candidate, right)| {
-            left.score
-                .total_cmp(&right.score)
+        .min_by(|(left_candidate, left, _), (right_candidate, right, _)| {
+            left.score_s
+                .cmp(&right.score_s)
+                .then_with(|| left.walking_duration_s.cmp(&right.walking_duration_s))
                 .then_with(|| {
                     left_candidate
+                        .candidate
                         .distance_to_destination_m
-                        .total_cmp(&right_candidate.distance_to_destination_m)
+                        .total_cmp(&right_candidate.candidate.distance_to_destination_m)
                 })
                 .then_with(|| left.drive_duration_s.cmp(&right.drive_duration_s))
                 .then_with(|| {
                     left_candidate
+                        .candidate
                         .spot_id
                         .into_uuid()
                         .as_u128()
-                        .cmp(&right_candidate.spot_id.into_uuid().as_u128())
+                        .cmp(&right_candidate.candidate.spot_id.into_uuid().as_u128())
                 })
         })
 }
@@ -226,7 +296,8 @@ mod tests {
     struct Calls {
         geocoded: Mutex<Vec<String>>,
         repository: Mutex<Vec<(Coordinate, u32, u32)>>,
-        matrix_destinations: Mutex<Vec<Vec<Coordinate>>>,
+        driving_destinations: Mutex<Vec<Vec<Coordinate>>>,
+        walking_requests: Mutex<Vec<(Vec<Coordinate>, Coordinate)>>,
         routes: Mutex<Vec<Coordinate>>,
     }
 
@@ -271,7 +342,9 @@ mod tests {
 
     struct FakeMatrix {
         calls: Arc<Calls>,
-        entries: Vec<RouteMatrixEntry>,
+        driving_entries: Vec<RouteMatrixEntry>,
+        walking_entries: Vec<WalkingRouteMatrixEntry>,
+        walking_error: Option<ExternalServiceError>,
     }
 
     #[async_trait]
@@ -282,11 +355,27 @@ mod tests {
             destinations: &[Coordinate],
         ) -> Result<Vec<RouteMatrixEntry>, ExternalServiceError> {
             self.calls
-                .matrix_destinations
+                .driving_destinations
                 .lock()
                 .unwrap()
                 .push(destinations.to_vec());
-            Ok(self.entries.clone())
+            Ok(self.driving_entries.clone())
+        }
+
+        async fn walking_costs(
+            &self,
+            origins: &[Coordinate],
+            destination: Coordinate,
+        ) -> Result<Vec<WalkingRouteMatrixEntry>, ExternalServiceError> {
+            self.calls
+                .walking_requests
+                .lock()
+                .unwrap()
+                .push((origins.to_vec(), destination));
+            if let Some(error) = self.walking_error {
+                return Err(error);
+            }
+            Ok(self.walking_entries.clone())
         }
     }
 
@@ -332,9 +421,19 @@ mod tests {
         }
     }
 
+    fn walking_entry(index: usize, duration_s: u64) -> WalkingRouteMatrixEntry {
+        WalkingRouteMatrixEntry {
+            origin_index: index,
+            distance_m: 500,
+            duration_s,
+            status: MatrixElementStatus::Reachable,
+        }
+    }
+
     fn service(
         candidates: Vec<ParkingCandidate>,
-        entries: Vec<RouteMatrixEntry>,
+        driving_entries: Vec<RouteMatrixEntry>,
+        walking_entries: Vec<WalkingRouteMatrixEntry>,
     ) -> (FindParking, Arc<Calls>) {
         let calls = Arc::new(Calls::default());
         let destination = GeocodedLocation {
@@ -353,7 +452,9 @@ mod tests {
             }),
             Arc::new(FakeMatrix {
                 calls: Arc::clone(&calls),
-                entries,
+                driving_entries,
+                walking_entries,
+                walking_error: None,
             }),
             Arc::new(FakeRoutes {
                 calls: Arc::clone(&calls),
@@ -367,9 +468,44 @@ mod tests {
         (service, calls)
     }
 
+    fn service_with_walking_failure(
+        candidates: Vec<ParkingCandidate>,
+        driving_entries: Vec<RouteMatrixEntry>,
+    ) -> FindParking {
+        let calls = Arc::new(Calls::default());
+        FindParking::new(
+            Arc::new(FakeGeocoder {
+                calls: Arc::clone(&calls),
+                result: Some(GeocodedLocation {
+                    coordinates: coordinate(52.2, 21.0),
+                    formatted_address: "Destination".into(),
+                    place_id: None,
+                }),
+            }),
+            Arc::new(FakeRepository {
+                calls: Arc::clone(&calls),
+                candidates,
+            }),
+            Arc::new(FakeMatrix {
+                calls,
+                driving_entries,
+                walking_entries: vec![],
+                walking_error: Some(ExternalServiceError::Upstream),
+            }),
+            Arc::new(FakeRoutes {
+                calls: Arc::new(Calls::default()),
+            }),
+            FindParkingConfig {
+                search_radius_m: 800,
+                candidate_limit: 25,
+            },
+        )
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn search_geocodes_destination() {
-        let (service, calls) = service(vec![], vec![]);
+        let (service, calls) = service(vec![], vec![], vec![]);
         let _ = service
             .execute(coordinate(52.1, 21.1), "  Marszałkowska 1  ")
             .await;
@@ -378,7 +514,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_queries_candidates_around_destination() {
-        let (service, calls) = service(vec![], vec![]);
+        let (service, calls) = service(vec![], vec![], vec![]);
         let _ = service.execute(coordinate(52.1, 21.1), "address").await;
         assert_eq!(
             *calls.repository.lock().unwrap(),
@@ -388,12 +524,13 @@ mod tests {
 
     #[tokio::test]
     async fn search_returns_no_available_parking_when_repository_is_empty() {
-        let (service, calls) = service(vec![], vec![]);
+        let (service, calls) = service(vec![], vec![], vec![]);
         assert_eq!(
             service.execute(coordinate(52.1, 21.1), "address").await,
             Ok(FindParkingOutcome::NoCandidates)
         );
-        assert!(calls.matrix_destinations.lock().unwrap().is_empty());
+        assert!(calls.driving_destinations.lock().unwrap().is_empty());
+        assert!(calls.walking_requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -406,7 +543,7 @@ mod tests {
             },
             matrix_entry(1, 100),
         ];
-        let (service, _) = service(candidates, entries);
+        let (service, _) = service(candidates, entries, vec![walking_entry(0, 80)]);
         let outcome = service
             .execute(coordinate(52.1, 21.1), "address")
             .await
@@ -424,27 +561,21 @@ mod tests {
             status: MatrixElementStatus::Unreachable,
             ..matrix_entry(0, 1)
         }];
-        let (service, calls) = service(candidates, entries);
+        let (service, calls) = service(candidates, entries, vec![]);
         assert_eq!(
             service.execute(coordinate(52.1, 21.1), "address").await,
             Ok(FindParkingOutcome::NoReachableParking)
         );
         assert!(calls.routes.lock().unwrap().is_empty());
+        assert!(calls.walking_requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn search_selects_candidate_with_lowest_combined_score() {
-        let candidates = vec![
-            candidate(1, 21.1, 700.0),
-            candidate(2, 21.2, 50.0),
-            candidate(3, 21.3, 20.0),
-        ];
-        let entries = vec![
-            matrix_entry(0, 120),
-            matrix_entry(1, 180),
-            matrix_entry(2, 240),
-        ];
-        let (service, _) = service(candidates, entries);
+    async fn ranking_uses_real_walking_duration() {
+        let candidates = vec![candidate(1, 21.1, 100.0), candidate(2, 21.2, 200.0)];
+        let driving = vec![matrix_entry(0, 100), matrix_entry(1, 160)];
+        let walking = vec![walking_entry(0, 600), walking_entry(1, 180)];
+        let (service, _) = service(candidates, driving, walking);
         let FindParkingOutcome::Found(result) = service
             .execute(coordinate(52.1, 21.1), "address")
             .await
@@ -453,13 +584,31 @@ mod tests {
             panic!("expected a selected parking spot");
         };
         assert_eq!(result.spot.spot_id.into_uuid(), Uuid::from_u128(2));
+        assert_eq!(result.ranking.score_s, 340);
+        assert_eq!(result.walk.duration_s, 180);
     }
 
     #[tokio::test]
     async fn tie_breaking_is_deterministic() {
-        let candidates = vec![candidate(2, 21.2, 14.0), candidate(1, 21.1, 14.0)];
-        let entries = vec![matrix_entry(0, 100), matrix_entry(1, 100)];
-        let (service, _) = service(candidates, entries);
+        let candidates = vec![
+            candidate(4, 21.4, 30.0),
+            candidate(3, 21.3, 20.0),
+            candidate(2, 21.2, 20.0),
+            candidate(1, 21.1, 20.0),
+        ];
+        let driving = vec![
+            matrix_entry(0, 100),
+            matrix_entry(1, 100),
+            matrix_entry(2, 100),
+            matrix_entry(3, 100),
+        ];
+        let walking = vec![
+            walking_entry(0, 100),
+            walking_entry(1, 100),
+            walking_entry(2, 100),
+            walking_entry(3, 100),
+        ];
+        let (service, _) = service(candidates, driving, walking);
         let FindParkingOutcome::Found(result) = service
             .execute(coordinate(52.1, 21.1), "address")
             .await
@@ -471,11 +620,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tie_breaking_prefers_shorter_walking_duration() {
+        let candidates = vec![candidate(1, 21.1, 1.0), candidate(2, 21.2, 100.0)];
+        let driving = vec![matrix_entry(0, 90), matrix_entry(1, 100)];
+        let walking = vec![walking_entry(0, 110), walking_entry(1, 100)];
+        let (service, _) = service(candidates, driving, walking);
+        let FindParkingOutcome::Found(result) = service
+            .execute(coordinate(52.1, 21.1), "address")
+            .await
+            .unwrap()
+        else {
+            panic!("expected a selected parking spot");
+        };
+        assert_eq!(result.spot.spot_id.into_uuid(), Uuid::from_u128(2));
+    }
+
+    #[tokio::test]
     async fn final_route_is_requested_only_for_selected_candidate() {
         let candidates = vec![candidate(1, 21.1, 700.0), candidate(2, 21.2, 50.0)];
         let entries = vec![matrix_entry(0, 120), matrix_entry(1, 180)];
         let selected = candidates[1].coordinates;
-        let (service, calls) = service(candidates, entries);
+        let walking = vec![walking_entry(0, 600), walking_entry(1, 100)];
+        let (service, calls) = service(candidates, entries, walking);
         let _ = service.execute(coordinate(52.1, 21.1), "address").await;
         assert_eq!(*calls.routes.lock().unwrap(), [selected]);
     }
@@ -485,8 +651,121 @@ mod tests {
         let candidates = (1..=30)
             .map(|id| candidate(id, 21.0 + id as f64 / 1_000.0, 10.0))
             .collect();
-        let (service, calls) = service(candidates, vec![]);
+        let (service, calls) = service(candidates, vec![], vec![]);
         let _ = service.execute(coordinate(52.1, 21.1), "address").await;
-        assert_eq!(calls.matrix_destinations.lock().unwrap()[0].len(), 25);
+        assert_eq!(calls.driving_destinations.lock().unwrap()[0].len(), 25);
+    }
+
+    #[tokio::test]
+    async fn candidate_requires_both_driving_and_walking_route() {
+        let candidates = vec![candidate(1, 21.1, 10.0), candidate(2, 21.2, 20.0)];
+        let driving = vec![matrix_entry(0, 10), matrix_entry(1, 20)];
+        let walking = vec![
+            WalkingRouteMatrixEntry {
+                status: MatrixElementStatus::Unreachable,
+                ..walking_entry(0, 1)
+            },
+            walking_entry(1, 50),
+        ];
+        let (service, _) = service(candidates, driving, walking);
+        let FindParkingOutcome::Found(result) = service
+            .execute(coordinate(52.1, 21.1), "address")
+            .await
+            .unwrap()
+        else {
+            panic!("expected a selected parking spot");
+        };
+        assert_eq!(result.spot.spot_id.into_uuid(), Uuid::from_u128(2));
+    }
+
+    #[tokio::test]
+    async fn all_walking_routes_unavailable_returns_no_reachable_parking() {
+        let candidates = vec![candidate(1, 21.1, 10.0)];
+        let walking = vec![WalkingRouteMatrixEntry {
+            status: MatrixElementStatus::Unreachable,
+            ..walking_entry(0, 1)
+        }];
+        let (service, calls) = service(candidates, vec![matrix_entry(0, 10)], walking);
+        assert_eq!(
+            service.execute(coordinate(52.1, 21.1), "address").await,
+            Ok(FindParkingOutcome::NoReachableParking)
+        );
+        assert!(calls.routes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn walking_request_failure_is_an_upstream_error() {
+        let service =
+            service_with_walking_failure(vec![candidate(1, 21.1, 10.0)], vec![matrix_entry(0, 10)]);
+        assert_eq!(
+            service.execute(coordinate(52.1, 21.1), "address").await,
+            Err(FindParkingError::External(ExternalServiceError::Upstream))
+        );
+    }
+
+    #[tokio::test]
+    async fn walking_matrix_is_not_called_when_no_driving_candidate_is_reachable() {
+        let candidates = vec![candidate(1, 21.1, 10.0)];
+        let driving = vec![RouteMatrixEntry {
+            status: MatrixElementStatus::Unreachable,
+            ..matrix_entry(0, 1)
+        }];
+        let (service, calls) = service(candidates, driving, vec![]);
+        let _ = service.execute(coordinate(52.1, 21.1), "address").await;
+        assert!(calls.walking_requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn walking_matrix_is_called_once_for_all_reachable_candidates() {
+        let candidates = vec![candidate(1, 21.1, 10.0), candidate(2, 21.2, 20.0)];
+        let driving = vec![matrix_entry(0, 10), matrix_entry(1, 20)];
+        let walking = vec![walking_entry(0, 40), walking_entry(1, 50)];
+        let (service, calls) = service(candidates, driving, walking);
+        let _ = service.execute(coordinate(52.1, 21.1), "address").await;
+        let requests = calls.walking_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0.len(), 2);
+        assert_eq!(requests[0].1, coordinate(52.2, 21.0));
+    }
+
+    #[tokio::test]
+    async fn walking_indices_are_remapped_after_driving_filter() {
+        let candidates = vec![
+            candidate(1, 21.1, 10.0),
+            candidate(2, 21.2, 20.0),
+            candidate(3, 21.3, 30.0),
+            candidate(4, 21.4, 40.0),
+        ];
+        let driving = vec![
+            matrix_entry(0, 100),
+            RouteMatrixEntry {
+                status: MatrixElementStatus::Unreachable,
+                ..matrix_entry(1, 1)
+            },
+            matrix_entry(2, 100),
+            matrix_entry(3, 100),
+        ];
+        let walking = vec![WalkingRouteMatrixEntry {
+            origin_index: 1,
+            ..walking_entry(0, 50)
+        }];
+        let (service, calls) = service(candidates, driving, walking);
+        let FindParkingOutcome::Found(result) = service
+            .execute(coordinate(52.1, 21.1), "address")
+            .await
+            .unwrap()
+        else {
+            panic!("expected C to be selected");
+        };
+        assert_eq!(result.spot.spot_id.into_uuid(), Uuid::from_u128(3));
+        let requests = calls.walking_requests.lock().unwrap();
+        assert_eq!(
+            requests[0].0,
+            [
+                coordinate(52.0, 21.1),
+                coordinate(52.0, 21.3),
+                coordinate(52.0, 21.4)
+            ]
+        );
     }
 }
