@@ -1,8 +1,8 @@
 # parking-platform
 
 Minimalny backend systemu parkingowego w Rust. Workspace zawiera czystą bibliotekę domenową,
-wersjonowane kontrakty zdarzeń, persistence w PostgreSQL/PostGIS, API HTTP, worker ingestion
-oraz simulator kamery publikujący do NATS JetStream.
+wersjonowane kontrakty zdarzeń, wyszukiwanie i ranking miejsc, persistence w PostgreSQL/PostGIS,
+API HTTP, worker ingestion oraz simulator kamery publikujący do NATS JetStream.
 
 ## Lokalne uruchomienie
 
@@ -15,6 +15,16 @@ docker compose ps
 export DATABASE_URL=postgres://parking:parking@localhost:5432/parking
 export NATS_URL=nats://127.0.0.1:4222
 cargo run -p parking-api
+```
+
+Integracja Google jest opcjonalna przy starcie. Bez `GOOGLE_MAPS_API_KEY` healthcheck i pozostałe
+endpointy działają, a `POST /v1/parking/search` zwraca kontrolowany błąd `503`. Konfiguracja:
+
+```bash
+export GOOGLE_MAPS_API_KEY='...'          # sekret; nie zapisuj go w repozytorium
+export GOOGLE_MAPS_HTTP_TIMEOUT_MS=3000   # domyślnie 3000
+export PARKING_SEARCH_RADIUS_M=800        # domyślnie 800
+export PARKING_CANDIDATE_LIMIT=25         # domyślnie 25, maksymalnie 625
 ```
 
 Przy starcie API automatycznie wykonuje migracje SQLx. W środowisku produkcyjnym migracje
@@ -128,6 +138,60 @@ curl -i -X POST http://127.0.0.1:3000/v1/observations \
     \"model_version\": \"occupancy-v1\"
   }"
 ```
+
+## Wyszukiwanie i ranking parkingu
+
+```text
+POST /v1/parking/search
+        |
+        v
+Geocoding API v4
+        |
+        v
+PostGIS: świeże i wolne miejsca w promieniu
+        |
+        v
+Routes API v2: Compute Route Matrix
+        |
+        v
+ranking
+        |
+        v
+Routes API v2: Compute Routes dla zwycięzcy
+        |
+        v
+odpowiedź z ETA i encoded polyline
+```
+
+PostGIS ogranicza liczbę płatnych elementów macierzy przed wywołaniem Google. Dla jednego
+wyszukiwania wykonywane jest najwyżej jedno wywołanie Route Matrix oraz jedno Compute Routes.
+Wynik geokodowania z wieloma dopasowaniami używa pierwszego wyniku; interaktywne ujednoznacznianie
+adresu nie należy jeszcze do tego etapu.
+
+Ranking używa przybliżenia marszu z prędkością 1,4 m/s:
+
+```text
+walking_proxy_seconds = distance_to_destination_m / 1.4
+score_s = driving_duration_s + walking_proxy_seconds
+```
+
+Remisy rozstrzygają kolejno: niższy score, mniejsza odległość miejsca od celu, krótszy czas
+dojazdu i na końcu stabilne sortowanie po identyfikatorze miejsca.
+
+Manualny test wymaga działającej infrastruktury, świeżej obserwacji `free` oraz prawdziwego klucza
+z włączonymi Geocoding API v4 i Routes API:
+
+```bash
+curl -i -X POST http://127.0.0.1:3000/v1/parking/search \
+  -H 'content-type: application/json' \
+  -d '{
+    "origin": {"latitude": 52.2297, "longitude": 21.0122},
+    "destination_address": "Marszałkowska 10, Warszawa"
+  }'
+```
+
+Serwer używa klucza tylko w nagłówku `X-Goog-Api-Key`. Nie przekazuj go w URL ani nie commituj
+plików `.env`; są ignorowane przez Git.
 
 ## Testy i kontrola jakości
 

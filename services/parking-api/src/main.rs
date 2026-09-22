@@ -1,4 +1,4 @@
-use std::{env, net::SocketAddr};
+use std::{env, net::SocketAddr, sync::Arc, time::Duration as StdDuration};
 
 use axum::{
     Json, Router,
@@ -7,17 +7,25 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
+use google_maps_adapter::GoogleMapsClient;
 use parking_domain::{CameraId, EventId, ObservedState, ParkingSpotId, SpotObservation};
 use parking_persistence::{
     CreateParkingSpotResult, ParkingRepository, RepositoryError, StoreObservationResult,
+};
+use parking_search::{
+    Coordinate, DEFAULT_OBSERVATION_TTL, ExternalServiceError, FindParking, FindParkingConfig,
+    FindParkingError, FindParkingOutcome, ParkingSearchResult,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
-const OBSERVATION_TTL: Duration = Duration::seconds(15);
 const MAX_SEARCH_RADIUS_METERS: f64 = 5_000.0;
+const DEFAULT_GOOGLE_MAPS_HTTP_TIMEOUT_MS: u64 = 3_000;
+const DEFAULT_PARKING_SEARCH_RADIUS_M: u32 = 800;
+const DEFAULT_PARKING_CANDIDATE_LIMIT: u32 = 25;
+const MAX_PARKING_CANDIDATE_LIMIT: u32 = 625;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -25,22 +33,97 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|_| "DATABASE_URL must be set before starting parking-api")?;
     let repository = ParkingRepository::connect(&database_url).await?;
     repository.migrate().await?;
+    let parking_search = build_parking_search(&repository)?;
 
     let address = SocketAddr::from(([0, 0, 0, 0], 3000));
     let listener = TcpListener::bind(address).await?;
 
     println!("parking-api listening on http://{address}");
-    axum::serve(listener, app(repository)).await?;
+    axum::serve(
+        listener,
+        app(AppState {
+            repository,
+            parking_search,
+        }),
+    )
+    .await?;
     Ok(())
 }
 
-fn app(repository: ParkingRepository) -> Router {
+#[derive(Clone)]
+struct AppState {
+    repository: ParkingRepository,
+    parking_search: Option<Arc<FindParking>>,
+}
+
+fn app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/parking-spots", post(create_parking_spot))
         .route("/v1/observations", post(create_observation))
         .route("/v1/parking-spots/free", get(find_free_parking_spots))
-        .with_state(repository)
+        .route("/v1/parking/search", post(find_parking))
+        .with_state(state)
+}
+
+fn build_parking_search(
+    repository: &ParkingRepository,
+) -> Result<Option<Arc<FindParking>>, Box<dyn std::error::Error>> {
+    let timeout_ms = environment_u64(
+        "GOOGLE_MAPS_HTTP_TIMEOUT_MS",
+        DEFAULT_GOOGLE_MAPS_HTTP_TIMEOUT_MS,
+    )?;
+    let search_radius_m =
+        environment_u32("PARKING_SEARCH_RADIUS_M", DEFAULT_PARKING_SEARCH_RADIUS_M)?;
+    let candidate_limit =
+        environment_u32("PARKING_CANDIDATE_LIMIT", DEFAULT_PARKING_CANDIDATE_LIMIT)?;
+    if timeout_ms == 0 || search_radius_m == 0 || candidate_limit == 0 {
+        return Err("Google timeout, search radius and candidate limit must be positive".into());
+    }
+    if candidate_limit > MAX_PARKING_CANDIDATE_LIMIT {
+        return Err("PARKING_CANDIDATE_LIMIT must not exceed 625".into());
+    }
+
+    let Ok(api_key) = env::var("GOOGLE_MAPS_API_KEY") else {
+        println!("parking search disabled: GOOGLE_MAPS_API_KEY is not configured");
+        return Ok(None);
+    };
+    if api_key.trim().is_empty() {
+        println!("parking search disabled: GOOGLE_MAPS_API_KEY is empty");
+        return Ok(None);
+    }
+
+    let google = Arc::new(GoogleMapsClient::new(
+        api_key,
+        StdDuration::from_millis(timeout_ms),
+    )?);
+    let search = FindParking::new(
+        google.clone(),
+        Arc::new(repository.clone()),
+        google.clone(),
+        google,
+        FindParkingConfig {
+            search_radius_m,
+            candidate_limit,
+        },
+    )?;
+    Ok(Some(Arc::new(search)))
+}
+
+fn environment_u64(name: &str, default: u64) -> Result<u64, Box<dyn std::error::Error>> {
+    env::var(name).map_or(Ok(default), |value| {
+        value
+            .parse()
+            .map_err(|_| format!("{name} must be an unsigned integer").into())
+    })
+}
+
+fn environment_u32(name: &str, default: u32) -> Result<u32, Box<dyn std::error::Error>> {
+    env::var(name).map_or(Ok(default), |value| {
+        value
+            .parse()
+            .map_err(|_| format!("{name} must be an unsigned integer").into())
+    })
 }
 
 async fn health() -> StatusCode {
@@ -48,14 +131,15 @@ async fn health() -> StatusCode {
 }
 
 async fn create_parking_spot(
-    State(repository): State<ParkingRepository>,
+    State(state): State<AppState>,
     payload: Result<Json<CreateParkingSpotRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
     let Json(payload) = payload.map_err(|_| ApiError::bad_request("invalid JSON body"))?;
     validate_coordinates(payload.latitude, payload.longitude)?;
 
     let id = ParkingSpotId::from_uuid(payload.id);
-    let result = repository
+    let result = state
+        .repository
         .create_parking_spot(id, payload.latitude, payload.longitude)
         .await
         .map_err(|_| ApiError::internal())?;
@@ -68,7 +152,7 @@ async fn create_parking_spot(
 }
 
 async fn create_observation(
-    State(repository): State<ParkingRepository>,
+    State(state): State<AppState>,
     payload: Result<Json<CreateObservationRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
     let Json(payload) = payload.map_err(|_| ApiError::bad_request("invalid JSON body"))?;
@@ -83,7 +167,8 @@ async fn create_observation(
         model_version: payload.model_version,
     };
 
-    let result = repository
+    let result = state
+        .repository
         .store_observation(&observation)
         .await
         .map_err(map_repository_error)?;
@@ -96,7 +181,7 @@ async fn create_observation(
 }
 
 async fn find_free_parking_spots(
-    State(repository): State<ParkingRepository>,
+    State(state): State<AppState>,
     Query(query): Query<FindFreeParkingSpotsQuery>,
 ) -> Result<Json<FindFreeParkingSpotsResponse>, ApiError> {
     validate_coordinates(query.lat, query.lon)?;
@@ -109,13 +194,14 @@ async fn find_free_parking_spots(
         ));
     }
 
-    let spots = repository
+    let spots = state
+        .repository
         .find_free_parking_spots(
             query.lat,
             query.lon,
             query.radius_m,
             Utc::now(),
-            OBSERVATION_TTL,
+            DEFAULT_OBSERVATION_TTL,
         )
         .await
         .map_err(|_| ApiError::internal())?
@@ -132,17 +218,74 @@ async fn find_free_parking_spots(
     Ok(Json(FindFreeParkingSpotsResponse { spots }))
 }
 
-fn validate_coordinates(latitude: f64, longitude: f64) -> Result<(), ApiError> {
-    if !latitude.is_finite()
-        || !longitude.is_finite()
-        || !(-90.0..=90.0).contains(&latitude)
-        || !(-180.0..=180.0).contains(&longitude)
-    {
+async fn find_parking(
+    State(state): State<AppState>,
+    payload: Result<Json<FindParkingRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let Json(payload) = payload.map_err(|_| ApiError::bad_request("invalid JSON body"))?;
+    let origin = Coordinate::new(payload.origin.latitude, payload.origin.longitude)
+        .map_err(|_| ApiError::bad_request("invalid origin coordinates"))?;
+    if payload.destination_address.trim().is_empty() {
         return Err(ApiError::bad_request(
-            "latitude must be in [-90, 90] and longitude in [-180, 180]",
+            "destination_address must not be empty",
         ));
     }
-    Ok(())
+    let search = state.parking_search.ok_or_else(ApiError::not_configured)?;
+    let outcome = search
+        .execute(origin, &payload.destination_address)
+        .await
+        .map_err(map_search_error)?;
+
+    match outcome {
+        FindParkingOutcome::Found(result) => Ok((
+            StatusCode::OK,
+            Json(FindParkingResponse::from_result(
+                payload.destination_address,
+                result,
+            )),
+        )
+            .into_response()),
+        FindParkingOutcome::NoCandidates => Ok((
+            StatusCode::OK,
+            Json(EmptyParkingSearchResponse {
+                result: None,
+                reason: "no_available_parking",
+            }),
+        )
+            .into_response()),
+        FindParkingOutcome::NoReachableParking => Ok((
+            StatusCode::OK,
+            Json(EmptyParkingSearchResponse {
+                result: None,
+                reason: "no_reachable_parking",
+            }),
+        )
+            .into_response()),
+    }
+}
+
+fn validate_coordinates(latitude: f64, longitude: f64) -> Result<(), ApiError> {
+    Coordinate::new(latitude, longitude)
+        .map(|_| ())
+        .map_err(|_| ApiError::bad_request("invalid coordinates"))
+}
+
+fn map_search_error(error: FindParkingError) -> ApiError {
+    match error {
+        FindParkingError::EmptyDestinationAddress => {
+            ApiError::bad_request("destination_address must not be empty")
+        }
+        FindParkingError::AddressNotFound => ApiError::unprocessable_entity("address_not_found"),
+        FindParkingError::External(ExternalServiceError::Timeout) => ApiError::gateway_timeout(),
+        FindParkingError::External(
+            ExternalServiceError::QuotaExceeded
+            | ExternalServiceError::Upstream
+            | ExternalServiceError::MalformedResponse,
+        ) => ApiError::bad_gateway(),
+        FindParkingError::Repository(_) | FindParkingError::InvalidConfiguration => {
+            ApiError::internal()
+        }
+    }
 }
 
 fn map_repository_error(error: RepositoryError) -> ApiError {
@@ -223,6 +366,99 @@ struct FreeParkingSpotResponse {
     distance_m: f64,
 }
 
+#[derive(Deserialize)]
+struct FindParkingRequest {
+    origin: CoordinateDto,
+    destination_address: String,
+}
+
+#[derive(Deserialize)]
+struct CoordinateDto {
+    latitude: f64,
+    longitude: f64,
+}
+
+#[derive(Serialize)]
+struct FindParkingResponse {
+    destination: DestinationResponse,
+    parking_spot: SelectedParkingSpotResponse,
+    ranking: RankingResponse,
+    route: RouteResponse,
+}
+
+impl FindParkingResponse {
+    fn from_result(input_address: String, result: ParkingSearchResult) -> Self {
+        Self {
+            destination: DestinationResponse {
+                input_address,
+                formatted_address: result.destination.formatted_address,
+                latitude: result.destination.coordinates.latitude(),
+                longitude: result.destination.coordinates.longitude(),
+                place_id: result.destination.place_id,
+            },
+            parking_spot: SelectedParkingSpotResponse {
+                id: result.spot.spot_id.into_uuid(),
+                latitude: result.spot.coordinates.latitude(),
+                longitude: result.spot.coordinates.longitude(),
+                observed_at: result.spot.observed_at,
+                distance_to_destination_m: result.spot.distance_to_destination_m,
+            },
+            ranking: RankingResponse {
+                driving_duration_s: result.ranking.drive_duration_s,
+                driving_distance_m: result.ranking.drive_distance_m,
+                walking_proxy_distance_m: result.spot.distance_to_destination_m,
+                walking_proxy_duration_s: result.ranking.walking_proxy_seconds,
+                score_s: result.ranking.score,
+            },
+            route: RouteResponse {
+                distance_m: result.route.distance_m,
+                duration_s: result.route.duration_s,
+                encoded_polyline: result.route.encoded_polyline,
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct DestinationResponse {
+    input_address: String,
+    formatted_address: String,
+    latitude: f64,
+    longitude: f64,
+    place_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SelectedParkingSpotResponse {
+    id: Uuid,
+    latitude: f64,
+    longitude: f64,
+    observed_at: DateTime<Utc>,
+    distance_to_destination_m: f64,
+}
+
+#[derive(Serialize)]
+struct RankingResponse {
+    driving_duration_s: u64,
+    driving_distance_m: u64,
+    walking_proxy_distance_m: f64,
+    walking_proxy_duration_s: f64,
+    score_s: f64,
+}
+
+#[derive(Serialize)]
+struct RouteResponse {
+    distance_m: u64,
+    duration_s: u64,
+    encoded_polyline: String,
+}
+
+#[derive(Serialize)]
+struct EmptyParkingSearchResponse {
+    result: Option<()>,
+    reason: &'static str,
+}
+
 struct ApiError {
     status: StatusCode,
     message: &'static str,
@@ -240,6 +476,34 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_FOUND,
             message,
+        }
+    }
+
+    const fn unprocessable_entity(message: &'static str) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message,
+        }
+    }
+
+    const fn not_configured() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "parking_search_not_configured",
+        }
+    }
+
+    const fn bad_gateway() -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            message: "google_maps_upstream_failure",
+        }
+    }
+
+    const fn gateway_timeout() -> Self {
+        Self {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            message: "google_maps_timeout",
         }
     }
 

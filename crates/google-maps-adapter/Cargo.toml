@@ -1,16 +1,16 @@
 [package]
-name = "parking-persistence"
+name = "google-maps-adapter"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
-chrono = { workspace = true }
-parking-domain = { path = "../parking-domain" }
 parking-search = { path = "../parking-search" }
-sqlx = { workspace = true }
-uuid = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wiremock = "0.6"

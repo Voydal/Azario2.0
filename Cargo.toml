@@ -3,7 +3,9 @@ resolver = "2"
 members = [
     "crates/parking-domain",
     "crates/parking-events",
+    "crates/parking-search",
     "crates/parking-persistence",
+    "crates/google-maps-adapter",
     "services/parking-ingestion-worker",
     "services/parking-api",
     "tools/camera-simulator",
@@ -15,10 +17,12 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
+async-trait = "0.1"
 async-nats = { version = "0.50", features = ["jetstream"] }
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlx = { version = "0.8", default-features = false, features = ["chrono", "macros", "migrate", "postgres", "runtime-tokio", "uuid"] }

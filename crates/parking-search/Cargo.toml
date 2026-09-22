@@ -1,5 +1,5 @@
 [package]
-name = "parking-persistence"
+name = "parking-search"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,9 +8,7 @@ license.workspace = true
 async-trait = { workspace = true }
 chrono = { workspace = true }
 parking-domain = { path = "../parking-domain" }
-parking-search = { path = "../parking-search" }
-sqlx = { workspace = true }
-uuid = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt"] }
+uuid = { workspace = true }

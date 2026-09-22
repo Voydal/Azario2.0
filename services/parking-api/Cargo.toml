@@ -7,8 +7,11 @@ license.workspace = true
 [dependencies]
 axum = { workspace = true }
 chrono = { workspace = true }
+google-maps-adapter = { path = "../../crates/google-maps-adapter" }
 parking-domain = { path = "../../crates/parking-domain" }
 parking-persistence = { path = "../../crates/parking-persistence" }
+parking-search = { path = "../../crates/parking-search" }
+reqwest = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 uuid = { workspace = true }

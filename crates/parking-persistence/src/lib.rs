@@ -1,7 +1,12 @@
 use std::{error::Error, fmt};
 
+use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use parking_domain::{AvailabilityState, ObservedState, ParkingSpotId, SpotObservation};
+use parking_search::{
+    Coordinate, DEFAULT_OBSERVATION_TTL, ParkingCandidate, ParkingCandidateRepository,
+    ParkingRepositoryError,
+};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 
 const SEARCH_RESULT_LIMIT: i64 = 100;
@@ -139,6 +144,26 @@ impl ParkingRepository {
         now: DateTime<Utc>,
         ttl: Duration,
     ) -> Result<Vec<FreeParkingSpot>, sqlx::Error> {
+        self.find_free_parking_spots_limited(
+            latitude,
+            longitude,
+            radius_m,
+            now,
+            ttl,
+            SEARCH_RESULT_LIMIT,
+        )
+        .await
+    }
+
+    async fn find_free_parking_spots_limited(
+        &self,
+        latitude: f64,
+        longitude: f64,
+        radius_m: f64,
+        now: DateTime<Utc>,
+        ttl: Duration,
+        limit: i64,
+    ) -> Result<Vec<FreeParkingSpot>, sqlx::Error> {
         let freshness_cutoff = now - ttl;
         let rows = sqlx::query(
             r#"
@@ -169,7 +194,7 @@ impl ParkingRepository {
         .bind(longitude)
         .bind(radius_m)
         .bind(freshness_cutoff)
-        .bind(SEARCH_RESULT_LIMIT)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
 
@@ -184,6 +209,39 @@ impl ParkingRepository {
                 })
             })
             .collect()
+    }
+}
+
+#[async_trait]
+impl ParkingCandidateRepository for ParkingRepository {
+    async fn find_candidates(
+        &self,
+        center: Coordinate,
+        radius_m: u32,
+        limit: u32,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<ParkingCandidate>, ParkingRepositoryError> {
+        self.find_free_parking_spots_limited(
+            center.latitude(),
+            center.longitude(),
+            f64::from(radius_m),
+            now,
+            DEFAULT_OBSERVATION_TTL,
+            i64::from(limit),
+        )
+        .await
+        .map_err(|_| ParkingRepositoryError)?
+        .into_iter()
+        .map(|spot| {
+            Ok(ParkingCandidate {
+                spot_id: spot.id,
+                coordinates: Coordinate::new(spot.latitude, spot.longitude)
+                    .map_err(|_| ParkingRepositoryError)?,
+                observed_at: spot.observed_at,
+                distance_to_destination_m: spot.distance_m,
+            })
+        })
+        .collect()
     }
 }
 
