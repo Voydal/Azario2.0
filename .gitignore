@@ -10,3 +10,9 @@
 /web/dist/
 /web/coverage/
 /web/*.tsbuildinfo
+*.onnx
+*.mp4
+edge-state.db
+edge-state.db-*
+/artifacts/
+/config/edge-camera.toml

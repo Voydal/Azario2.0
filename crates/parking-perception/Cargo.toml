@@ -1,0 +1,10 @@
+[package]
+name = "parking-perception"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono = { workspace = true }
+geo = { workspace = true }
+parking-domain = { path = "../parking-domain" }

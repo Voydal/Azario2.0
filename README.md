@@ -272,6 +272,151 @@ Manualny smoke test:
 Google walking routes pozostają beta. Każdy klient prezentujący ich wynik musi pokazać zwrócone
 przez backend ostrzeżenie o możliwych brakach chodników i ścieżek pieszych.
 
+## Edge perception dla nagranego wideo
+
+Etap 7 dodaje alternatywnego producenta tego samego kontraktu zdarzeń; `camera-simulator` pozostaje
+dostępny do testowania backendu bez Computer Vision.
+
+```text
+recorded video
+      |
+GStreamer (RGB)
+      |
+frame sampling
+      |
+ONNX ParkingDetectorV1 (CPU)
+      |
+vehicle detections
+      |
+parking-perception: normalized ROI occupancy
+      |
+temporal stabilizer
+      |
+SpotObservationV1
+      |
+NATS JetStream
+      |
+parking-ingestion-worker
+      |
+PostgreSQL
+```
+
+`parking-perception` jest czystą biblioteką domenowej logiki CV. Nie zależy od NATS, GStreamer,
+ONNX Runtime, SQLx ani Axum. `parking-edge-agent` zawiera źródło klatek, adapter modelu,
+konfigurację, trwałą sekwencję i publikację.
+
+### Zależności systemowe i uruchomienie
+
+Bindingi GStreamer 0.25.x wymagają Rust 1.92 oraz developerskich bibliotek GStreamer. Nazwy
+pakietów zależą od dystrybucji. Przykładowo na Debianie/Ubuntu są to między innymi:
+
+```bash
+sudo apt install pkg-config libglib2.0-dev libgstreamer1.0-dev \
+  libgstreamer-plugins-base1.0-dev gstreamer1.0-tools \
+  gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav
+```
+
+Na Fedorze odpowiednikami są zwykle `pkgconf-pkg-config`, `gstreamer1-devel`,
+`gstreamer1-plugins-base-devel` oraz potrzebne zestawy pluginów. Należy korzystać z pakietów
+systemowych danej dystrybucji.
+
+Skopiuj i dostosuj przykładową konfigurację. Lokalnego pliku, modelu, wideo i bazy stanu nie należy
+commitować:
+
+```bash
+cp config/edge-camera.example.toml config/edge-camera.toml
+export NATS_URL=nats://127.0.0.1:4222
+export PARKING_MODEL_PATH=/absolute/path/to/parking-detector-v1.onnx # opcjonalny override
+export PARKING_VIDEO_PATH=/absolute/path/to/parking-camera.mp4 # opcjonalny override
+cargo run -p parking-edge-agent -- --config config/edge-camera.toml
+```
+
+Przed edge agentem uruchom NATS i `parking-ingestion-worker`, który provisionuje istniejący stream
+`PARKING_OBSERVATIONS`. Agent publikuje na istniejący subject `parking.observations.v1`, czeka na
+JetStream publish ACK i ustawia `Nats-Msg-Id` na nowe `event_id`. Model nie jest pobierany przy
+starcie; brak wskazanego pliku jest czytelnym błędem startupu. Domyślnym i jedynym wspieranym
+providerem Etapu 7 jest CPU. ORT jest ładowany dynamicznie, aby build i testy nie pobierały zależnej
+od platformy biblioteki binarnej. Przy uruchamianiu ustaw `ORT_DYLIB_PATH` na zgodną bibliotekę
+`libonnxruntime.so` (ONNX Runtime dla CPU); brak biblioteki powoduje kontrolowany błąd startupu.
+
+### Algorytm occupancy i stabilizacja
+
+ROI miejsc oraz bounding boxy używają współrzędnych znormalizowanych `0..=1`. Dla każdej detekcji,
+której `class_id` znajduje się w konfigurowanym `vehicle_class_ids` i której confidence przekracza
+próg, liczony jest:
+
+```text
+spot_overlap_ratio = intersection_area(spot_polygon, vehicle_bbox) / spot_polygon_area
+occupancy_score = max(detection.confidence * spot_overlap_ratio)
+```
+
+To celowo nie jest klasyczne IoU. Wynik `<= free_threshold` oznacza `Free`, wynik
+`>= occupied_threshold` oznacza `Occupied`, a martwa strefa między progami oznacza `Uncertain`.
+Brak pasującej detekcji daje score `0`, ale wyłącznie dla poprawnie przetworzonej klatki.
+
+Inferencja wykonywana jest najwyżej co `sample_interval_ms`. Nowa klasyfikacja staje się stabilna
+dopiero po `stable_samples_required` kolejnych zgodnych próbkach. Event powstaje natychmiast po
+zmianie stabilnego stanu albo, bez zmiany, gdy od poprzedniej emisji upłynął
+`observation_refresh_interval_ms`. Walidacja wymaga, aby refresh był krótszy od backendowego TTL
+15 s; przykład używa 5 s.
+
+Wartości przykładowe: confidence `0.50`, free `0.10`, occupied `0.30`, sampling `500 ms` i trzy
+stabilne próbki są wyłącznie początkowymi parametrami eksperymentalnymi. Nie są naukowo optymalne;
+docelowo należy je skalibrować na oznaczonym zbiorze walidacyjnym i zgodnie z label map konkretnego
+modelu. Przykładowe ID klas `[2, 3, 5, 7]` również muszą zostać dopasowane do label map modelu.
+
+### Kontrakt modelu ParkingDetectorV1
+
+Adapter nie deklaruje zgodności z dowolnym surowym eksportem YOLO. Obsługuje dokładnie model po NMS:
+
+```text
+input:  float32 [1, 3, H, W], RGB, CHW, wartości [0,1]
+output: float32 [N, 6]
+row:    [x_min, y_min, x_max, y_max, confidence, class_id]
+bbox:   współrzędne znormalizowane względem oryginalnej klatki
+```
+
+Preprocessing przyjmuje spakowany RGB z GStreamer, wykonuje jawny nearest-neighbor stretch resize
+do `input_width` × `input_height`, normalizację `[0,255] -> [0,1]`, HWC -> CHW i dodaje batch.
+Stretch jest świadomym ograniczeniem MVP: może zniekształcić proporcje. Ponieważ wejście i output
+są normalizowane w obu osiach niezależnie, bbox nie wymaga transformacji letterbox. Surowy YOLO
+wymagający dekodowania anchors, mapowania tensorów lub NMS potrzebuje osobnego postprocessora.
+Niepoprawne bboxy, confidence lub class ID z modelu kończą inferencję tej klatki kontrolowanym
+błędem bez panic. Brak detekcji w poprawnym output `[0,6]` jest odrębnym przypadkiem.
+
+### Failure i restart semantics
+
+- Brak/zatrzymanie wideo nie tworzy `Free`: nie ma eventu, refresh ustaje, a backend po TTL przechodzi
+  do `UNKNOWN`.
+- Błąd pojedynczej inferencji jest logowany i nie aktualizuje stabilizatora. Długotrwały błąd także
+  kończy się brakiem refreshu i backendowym `UNKNOWN`.
+- Stabilne `Uncertain` jest jawnie publikowane; backend mapuje je na `UNKNOWN` zamiast utrzymywać
+  poprzedni stan w nieskończoność.
+- Publish jest ponawiany maksymalnie pięć razy z opóźnieniami 100/200/400/800 ms przed piątą próbą.
+  Trwały outage jest logowany, a analiza może być kontynuowana; Etap 7 nie ma offline spoolera.
+- EOF kończy pipeline bez zapętlania i zamyka GStreamer. Ctrl+C jest obsługiwane między operacjami;
+  oczekiwanie na klatkę ma limit 5 s, więc zastoju źródła nie traktujemy jako końca pliku.
+- Brak/niezgodność pliku modelu przerywa startup zamiast pozorować działanie.
+
+Camera-wide `sequence` jest zapisywany w lokalnym SQLite wskazanym przez `state_database`. Numer jest
+alokowany i commitowany przed pierwszą próbą publikacji. Po restarcie następny numer jest większy od
+każdego wcześniej zaalokowanego. Nieudana publikacja może pozostawić lukę, ale numer nigdy nie jest
+używany ponownie — backend wymaga monotoniczności, nie ciągłości.
+
+Edge nie publikuje klatek, cropów, twarzy ani tablic rejestracyjnych. Do NATS trafia wyłącznie
+`SpotObservationV1` z metadanymi occupancy.
+
+Test GStreamer oparty na `videotestsrc` jest domyślnie ignorowany, ponieważ wymaga bibliotek i
+pluginów systemowych. Po ich instalacji uruchom:
+
+```bash
+cargo test -p parking-edge-agent gstreamer_pipeline_produces_rgb_frames -- --ignored
+```
+
+Opcjonalny live smoke wymaga kompatybilnego modelu `ParkingDetectorV1`, lokalnego pliku wideo,
+działającego workera i poprawnie skonfigurowanych ROI. Duże pliki `.onnx`, `.mp4`, katalog
+`artifacts/`, lokalna konfiguracja oraz `edge-state.db*` są ignorowane przez Git.
+
 ## Testy i kontrola jakości
 
 PostGIS i NATS z Compose muszą działać. Testy integracyjne wykonują prawdziwe zapytania do

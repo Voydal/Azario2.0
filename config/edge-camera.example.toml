@@ -1,0 +1,25 @@
+camera_id = "019c1234-1234-7000-8000-123456789abd"
+video_file = "./artifacts/parking-camera.mp4"
+sample_interval_ms = 500
+observation_refresh_interval_ms = 5000
+stable_samples_required = 3
+
+model_path = "./artifacts/parking-detector-v1.onnx"
+model_version = "parking-detector-v1"
+input_width = 640
+input_height = 640
+vehicle_class_ids = [2, 3, 5, 7]
+detection_confidence_threshold = 0.50
+
+free_threshold = 0.10
+occupied_threshold = 0.30
+state_database = "./edge-state.db"
+
+[[spots]]
+spot_id = "019c1234-1234-7000-8000-123456789abe"
+polygon = [
+  { x = 0.10, y = 0.50 },
+  { x = 0.30, y = 0.48 },
+  { x = 0.35, y = 0.82 },
+  { x = 0.08, y = 0.84 },
+]
