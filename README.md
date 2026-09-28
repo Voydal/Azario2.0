@@ -1,13 +1,80 @@
 # parking-platform
 
-Minimalny backend systemu parkingowego w Rust. Workspace zawiera czystą bibliotekę domenową,
-wersjonowane kontrakty zdarzeń, wyszukiwanie i ranking miejsc, persistence w PostgreSQL/PostGIS,
-API HTTP, worker ingestion oraz simulator kamery publikujący do NATS JetStream.
+I am developing parking-platform as a research and learning project: a distributed Rust system for estimating parking-space availability, with video processing at the edge. The application is designed with production concerns in mind, but it is **not production-ready**.
 
-## Lokalne uruchomienie
+## Project Background
 
-Wymagane są Rust oraz Docker z Docker Compose. Lokalne środowisko używa przypiętych obrazów
-`postgis/postgis:17-3.5` oraz `nats:2.15.0-alpine`.
+This project grew out of my engineering thesis. The thesis version was a much smaller MVP focused on proving the core idea. In this repository, I am deliberately extending that idea into a larger system to explore Rust, distributed systems, edge computer vision, cloud-native architecture, and SRE/DevOps. This repository is a continuation of the work, not a claim that the thesis had the same scope.
+
+## AI-Assisted Development
+
+I use AI coding tools, including OpenAI Codex, to help implement the application layer. Part of my goal is to examine how AI-assisted development can accelerate the evolution of an academic MVP into a larger system without replacing engineering judgment. I define the requirements, architecture, invariants, acceptance criteria, and design decisions, and I review the results. I do not treat generated code as correct by default; changes are checked through tests, static analysis, and review.
+
+I intend to do the later infrastructure and reliability work **hands-on myself**: containerization, observability, Kubernetes, IaC and cloud deployment, CI/CD and GitOps, security, SLOs, failure testing, and backup/disaster recovery. These are planned learning stages, not capabilities already present in the repository. The separation between AI-assisted application implementation and hands-on platform engineering is deliberate.
+
+## Current Status
+
+My application currently includes Rust services, PostgreSQL/PostGIS, NATS JetStream, idempotent ingestion, parking search, Google Routes integration, a React frontend, an edge perception pipeline, an ONNX adapter, offline evaluation, and detection generation. Domain, integration, and synthetic tests cover these paths. I have prepared an application operability contract for future deployment; it does not constitute a production deployment.
+
+### Current Limitations
+
+I have not completed real-world validation of an ONNX model on recorded parking footage. RTSP input and offline edge resilience are not implemented. Production infrastructure, cloud deployment, SLOs, and disaster recovery are also pending. Synthetic and integration tests must not be confused with validation on real-world data.
+
+## Architecture Overview
+
+```text
+Camera / simulator / recorded video
+             |
+             v
+     Edge perception
+             |
+             v
+       NATS JetStream
+             |
+             v
+     Ingestion worker
+             |
+             v
+    PostgreSQL/PostGIS
+             |
+             v
+        Parking API
+         /       \
+ Google Routes  React frontend
+```
+
+The simulator publishes observations without processing images. The edge agent processes local recordings; raw video is not sent to the cloud by default. Google Routes is an optional dependency of the search path, not of the health checks.
+
+## Engineering Principles
+
+- A stale FREE observation becomes UNKNOWN; a failure is never interpreted as FREE.
+- Producer sequence numbers, not timestamps, determine event order.
+- At-least-once messaging is paired with idempotent persistence.
+- Raw video stays at the edge by default.
+- Local geospatial filtering runs before paid routing API calls.
+- Failure and retry semantics are explicit; invalid requests and configuration are not retried indefinitely.
+
+## Application Operability
+
+The API exposes `GET /health/live` (process-only liveness), `GET /health/ready` (PostgreSQL `SELECT 1` with `DATABASE_CHECK_TIMEOUT_MS`, default 1500 ms), `GET /version`, and the legacy `GET /health`. If the database is unavailable, `/ready` returns 503 while `/live` remains 200. A liveness failure may call for a process restart; a readiness failure means the instance should stop receiving traffic. Neither Google APIs nor NATS are artificial readiness dependencies of the API.
+
+On SIGINT/SIGTERM, the API stops accepting new requests and allows active requests up to 10 seconds to finish. The worker stops fetching messages, gives the current message up to 10 seconds, and preserves ACK/NAK/TERM semantics; shutdown alone never causes an ACK. The edge agent handles SIGINT/SIGTERM with a 15-second shutdown limit, closes the frame source and local state store, and does not start another publish after it detects shutdown. A blocking frame read may delay its response until the source returns.
+
+All three services support `LOG_FORMAT=pretty|json` (default: pretty) and `RUST_LOG` (default: info). The API generates or propagates a valid UUID in `x-request-id`; its access log records the ID, method, path, status, and duration. Normal INFO logs do not include request bodies, complete headers, or a user's exact coordinates. Secrets such as `GOOGLE_MAPS_API_KEY`, `DATABASE_URL`, and NATS credentials must not appear in logs. `/version` returns the package version compiled into the binary and an optional `PARKING_GIT_SHA` supplied **at build time**; it does not invoke Git at runtime. Invalid startup configuration exits non-zero.
+
+Important configuration: `API_BIND_ADDRESS` (default `0.0.0.0:3000`), `DATABASE_URL`, `DATABASE_MAX_CONNECTIONS` (10), `DATABASE_ACQUIRE_TIMEOUT_MS` (2000), `DATABASE_CHECK_TIMEOUT_MS` (1500), `DATABASE_OPERATION_TIMEOUT_MS` (5000), `PARKING_SEARCH_TIMEOUT_MS` (15000), `FRONTEND_ORIGIN` (development default `http://localhost:5173`), `GOOGLE_MAPS_HTTP_TIMEOUT_MS` (3000), `PARKING_SEARCH_RADIUS_M` (800), `PARKING_CANDIDATE_LIMIT` (25, maximum 625), `NATS_URL` for the worker and edge agent, `LOG_FORMAT`, and `RUST_LOG`. Localhost appears only as an explicit development default. The worker limits startup DB/NATS connections to 5 seconds and an individual message to 10 seconds. Google operations use the configured HTTP timeout. There is no unbounded startup retry loop.
+
+I run migrations explicitly with `cargo run -p parking-api -- migrate` before starting API replicas or the worker. Success exits 0; failure exits non-zero. Neither service migrates automatically at startup. Persistent application state lives in PostgreSQL; the API has no critical in-memory-only user cache.
+
+## Roadmap
+
+**Application and perception:** 7.2B — validate with a real model and recording; 8 — RTSP camera integration; 8.1 — offline edge resilience. These items are planned, not complete.
+
+**Platform and SRE, which I plan to implement hands-on:** 9 — containerization; 10 — observability; 11 — Kubernetes; 12 — IaC and cloud; 12.1 — CI/CD and GitOps; 13 — security hardening; 14 — SLOs, alerting, and runbooks; 15 — load and chaos testing; 16 — backup and disaster recovery. This is a roadmap, not a list of deployed infrastructure.
+
+## Local Development
+
+You need Rust and Docker with Docker Compose. The local services use the pinned `postgis/postgis:17-3.5` and `nats:2.15.0-alpine` images.
 
 ```bash
 docker compose up -d
@@ -15,44 +82,44 @@ docker compose ps
 export DATABASE_URL=postgres://parking:parking@localhost:5432/parking
 export NATS_URL=nats://127.0.0.1:4222
 export FRONTEND_ORIGIN=http://localhost:5173
+cargo run -p parking-api -- migrate
 cargo run -p parking-api
 ```
 
-Integracja Google jest opcjonalna przy starcie. Bez `GOOGLE_MAPS_API_KEY` healthcheck i pozostałe
-endpointy działają, a `POST /v1/parking/search` zwraca kontrolowany błąd `503`. Konfiguracja:
+Google integration is optional at startup. Without `GOOGLE_MAPS_API_KEY`, health checks and other endpoints still work; `POST /v1/parking/search` returns a controlled 503. Configuration:
 
 ```bash
-export GOOGLE_MAPS_API_KEY='...'          # sekret; nie zapisuj go w repozytorium
-export GOOGLE_MAPS_HTTP_TIMEOUT_MS=3000   # domyślnie 3000
-export PARKING_SEARCH_RADIUS_M=800        # domyślnie 800
-export PARKING_CANDIDATE_LIMIT=25         # domyślnie 25, maksymalnie 625
+export GOOGLE_MAPS_API_KEY='...'          # secret; do not commit it
+export GOOGLE_MAPS_HTTP_TIMEOUT_MS=3000   # default 3000
+export PARKING_SEARCH_RADIUS_M=800        # default 800
+export PARKING_CANDIDATE_LIMIT=25         # default 25, maximum 625
 ```
 
-Przy starcie API automatycznie wykonuje migracje SQLx. W środowisku produkcyjnym migracje
-powinny docelowo być wykonywane przez osobny proces lub job.
+Run migrations explicitly with `parking-api migrate`; starting the API or worker does not change the schema.
 
-Healthcheck:
+Health checks and version:
 
 ```bash
-curl -i http://127.0.0.1:3000/health
+curl -i http://127.0.0.1:3000/health/live
+curl -i http://127.0.0.1:3000/health/ready
+curl -i http://127.0.0.1:3000/version
 ```
 
-Port `8222` udostępnia lokalny endpoint diagnostyczny NATS, np.
-`http://127.0.0.1:8222/healthz`.
+Port 8222 exposes the local NATS diagnostic endpoint, for example `http://127.0.0.1:8222/healthz`.
 
-Zatrzymanie lokalnej infrastruktury:
+Stop the local dependencies:
 
 ```bash
 docker compose down
 ```
 
-Pełny reset lokalnych danych:
+To reset **all local Compose data**:
 
 ```bash
 docker compose down -v
 ```
 
-## Asynchroniczny przepływ ingestion
+## Asynchronous Ingestion Flow
 
 ```text
 camera-simulator
@@ -62,18 +129,13 @@ camera-simulator
   -> PostgreSQL/PostGIS
 ```
 
-Stream `PARKING_OBSERVATIONS` zapisuje `parking.observations.v1` na dysku z `LimitsPolicy`
-i siedmiodniową retencją. Consumer `parking-ingestion-v1` używa `DeliverPolicy::All`, dzięki
-czemu przy pierwszym utworzeniu rozpoczyna od najstarszej nadal dostępnej wiadomości.
+The `PARKING_OBSERVATIONS` stream stores `parking.observations.v1` on disk using `LimitsPolicy` and seven-day retention. The durable `parking-ingestion-v1` consumer uses `DeliverPolicy::All`, so a newly created consumer starts with the oldest message still retained.
 
-Delivery jest typu at-least-once. Worker wykonuje ACK dopiero po commitcie PostgreSQL;
-przejściowy błąd bazy powoduje NAK i redelivery, a błędny JSON lub nieobsługiwana wersja
-kontraktu kończy się TERM. Ponowne dostarczenie po commitcie jest bezpieczne dzięki PK
-`event_id`, unikalności `(camera_id, spot_id, sequence)` oraz warunkowemu UPSERT-owi.
+Delivery is at least once. The worker ACKs only after the PostgreSQL commit. A transient database failure causes NAK and redelivery; malformed JSON or an unsupported contract version causes TERM. Redelivery after a commit is safe because of the `event_id` primary key, the unique `(camera_id, spot_id, sequence)` constraint, and a conditional UPSERT.
 
-## Manualny smoke test
+## Manual Smoke Test
 
-Utworzenie miejsca parkingowego:
+Create a parking spot:
 
 ```bash
 curl -i -X POST http://127.0.0.1:3000/v1/parking-spots \
@@ -85,7 +147,7 @@ curl -i -X POST http://127.0.0.1:3000/v1/parking-spots \
   }'
 ```
 
-W drugim terminalu uruchom worker:
+In a second terminal, start the worker:
 
 ```bash
 export DATABASE_URL=postgres://parking:parking@localhost:5432/parking
@@ -93,7 +155,7 @@ export NATS_URL=nats://127.0.0.1:4222
 cargo run -p parking-ingestion-worker
 ```
 
-W trzecim terminalu opublikuj obserwację FREE:
+In a third terminal, publish a FREE observation:
 
 ```bash
 export NATS_URL=nats://127.0.0.1:4222
@@ -104,13 +166,13 @@ cargo run -p camera-simulator -- \
   --state free
 ```
 
-Wyszukiwanie powinno zwrócić miejsce:
+The search should return the spot:
 
 ```bash
 curl -i 'http://127.0.0.1:3000/v1/parking-spots/free?lat=52.2297&lon=21.0122&radius_m=500'
 ```
 
-Następnie opublikuj OCCUPIED:
+Then publish an OCCUPIED observation:
 
 ```bash
 cargo run -p camera-simulator -- \
@@ -120,10 +182,9 @@ cargo run -p camera-simulator -- \
   --state occupied
 ```
 
-Ponowne wyszukiwanie nie powinno już zwrócić tego miejsca.
+The next search should no longer return that spot.
 
-Endpoint HTTP pozostaje developerską/debugową, niezależną ścieżką ingestion. Nie publikuje
-do NATS i nie wykonuje dual-write:
+The HTTP endpoint remains a separate development/debug ingestion path. It does not publish to NATS and does not perform a dual write:
 
 ```bash
 curl -i -X POST http://127.0.0.1:3000/v1/observations \
@@ -140,7 +201,7 @@ curl -i -X POST http://127.0.0.1:3000/v1/observations \
   }"
 ```
 
-## Wyszukiwanie i ranking parkingu
+## Parking Search and Ranking
 
 ```text
 POST /v1/parking/search
@@ -149,59 +210,47 @@ POST /v1/parking/search
 Geocoding API v4
         |
         v
-PostGIS: świeże i wolne miejsca w promieniu
+PostGIS: fresh, free spots within radius
         |
         v
 Routes API v2: Compute Route Matrix
-DRIVE: pozycja pojazdu -> miejsca
+DRIVE: vehicle position -> spots
         |
         v
-odrzucenie miejsc niedostępnych samochodem
+exclude spots unreachable by car
         |
         v
 Routes API v2: Compute Route Matrix
-WALK: dostępne miejsca -> cel
+WALK: reachable spots -> destination
         |
         v
-odrzucenie miejsc niedostępnych pieszo
+exclude spots unreachable on foot
         |
         v
-ranking DRIVE + WALK
+DRIVE + WALK ranking
         |
         v
-Routes API v2: Compute Routes dla zwycięzcy
+Routes API v2: Compute Routes for the winner
         |
         v
-odpowiedź z ETA i encoded polyline
+response with ETA and encoded polyline
 ```
 
-PostGIS ogranicza liczbę płatnych elementów macierzy przed wywołaniem Google. Dla jednego
-wyszukiwania wykonywane są najwyżej dwa wywołania Route Matrix (jedno DRIVE i jedno WALK)
-oraz jedno Compute Routes DRIVE dla zwycięzcy.
-Wynik geokodowania z wieloma dopasowaniami używa pierwszego wyniku; interaktywne ujednoznacznianie
-adresu nie należy jeszcze do tego etapu.
+PostGIS bounds the number of paid matrix elements before calling Google. A search performs at most two Route Matrix calls (one DRIVE and one WALK) and one DRIVE Compute Routes call for the winner. If geocoding returns several matches, the first is used; interactive address disambiguation is not implemented.
 
-Walking proxy oparty na odległości w linii prostej został usunięty z rankingu. Czas marszu
-pochodzi z rzeczywistej macierzy Google z `travelMode=WALK`. Ranking wynosi:
+The previous straight-line walking proxy has been removed from ranking. Walking duration now comes from the Google matrix with `travelMode=WALK`. The score is:
 
 ```text
 score_s = driving_duration_s + walking_duration_s
 ```
 
-Remisy rozstrzygają kolejno: krótszy rzeczywisty czas marszu, mniejsza odległość miejsca od celu
-według PostGIS, krótszy czas dojazdu i na końcu stabilne sortowanie po identyfikatorze miejsca.
+Ties are broken by shorter actual walking time, shorter PostGIS distance from the spot to the destination, shorter driving time, and finally a stable ordering by spot ID.
 
-Przy `N` kandydatach macierz DRIVE zawiera maksymalnie `N` elementów, a macierz WALK maksymalnie
-kolejne `N`. WALK jest wywoływany dopiero po odrzuceniu miejsc niedostępnych samochodem, więc
-rzeczywista liczba elementów może być mniejsza. Domyślny limit 25 oznacza najwyżej 50 elementów
-obu macierzy łącznie, bez wykonywania osobnego requestu dla każdego miejsca.
+With `N` candidates, the DRIVE matrix has at most `N` elements and the WALK matrix at most another `N`. WALK runs only for spots reachable by car, so the actual count may be lower. The default candidate limit of 25 means at most 50 matrix elements in total, without a separate request per spot.
 
-Google oznacza walking routes jako funkcję beta. Odpowiedź sukcesu zawiera ostrzeżenie
-`walking_routes_beta`; przyszły frontend prezentujący trasę pieszą musi poinformować użytkownika,
-że dane mogą nie obejmować wszystkich chodników i ścieżek pieszych.
+Google labels walking routes as beta. A successful response includes the `walking_routes_beta` warning; a frontend showing a walking route must tell users that some sidewalks and paths may be missing.
 
-Manualny test wymaga działającej infrastruktury, świeżej obserwacji `free` oraz prawdziwego klucza
-z włączonymi Geocoding API v4 i Routes API:
+A manual test requires running dependencies, a fresh `free` observation, and a real key enabled for Geocoding API v4 and Routes API:
 
 ```bash
 curl -i -X POST http://127.0.0.1:3000/v1/parking/search \
@@ -212,14 +261,11 @@ curl -i -X POST http://127.0.0.1:3000/v1/parking/search \
   }'
 ```
 
-Serwer używa klucza tylko w nagłówku `X-Goog-Api-Key`. Nie przekazuj go w URL ani nie commituj
-plików `.env`; są ignorowane przez Git.
+The server sends its key only in the `X-Goog-Api-Key` header. Do not put it in a URL or commit `.env` files; Git ignores them.
 
-## Frontend webowy
+## Web Frontend
 
-Frontend React/TypeScript znajduje się w `web/`. Routing pozostaje wyłącznie w backendzie:
-przeglądarka renderuje otrzymane markery i encoded driving polyline, ale nie wywołuje Route Matrix,
-Compute Routes ani Directions Service.
+The React/TypeScript frontend lives in `web/`. Routing stays in the backend: the browser renders returned markers and an encoded driving polyline, but it does not call Route Matrix, Compute Routes, or Directions Service.
 
 ```text
 SearchForm
@@ -229,7 +275,7 @@ SearchForm
   -> ParkingMap
 ```
 
-Konfiguracja developerska:
+Development setup:
 
 ```bash
 cd web
@@ -242,40 +288,29 @@ export VITE_PARKING_API_BASE_URL=http://127.0.0.1:3000
 npm run dev
 ```
 
-Aplikacja będzie dostępna pod `http://localhost:5173`. Backend powinien być uruchomiony z:
+The app will be available at `http://localhost:5173`. Start the backend with:
 
 ```bash
 export FRONTEND_ORIGIN=http://localhost:5173
 ```
 
-`GOOGLE_MAPS_API_KEY` jest sekretem serwerowym używanym przez Geocoding i Routes API — nigdy nie
-jest przekazywany do przeglądarki. `VITE_GOOGLE_MAPS_API_KEY` jest publicznym kluczem przeglądarkowym
-dla Maps JavaScript API. Należy ograniczyć go w Google Cloud wyłącznie do Maps JavaScript API oraz
-ustawić HTTP referrer restrictions dla rzeczywistych domen frontendu. Nie commituj `.env.local` ani
-żadnego prawdziwego klucza.
+`GOOGLE_MAPS_API_KEY` is a server-side secret for Geocoding and Routes API; it is never sent to the browser. `VITE_GOOGLE_MAPS_API_KEY` is a public browser key for Maps JavaScript API. Restrict it in Google Cloud to that API and add HTTP referrer restrictions for the actual frontend domains. Do not commit `.env.local` or real keys.
 
-Advanced Markers wymagają map ID. `DEMO_MAP_ID` służy wyłącznie do developmentu; środowisko
-produkcyjne powinno podawać własne `VITE_GOOGLE_MAP_ID`. Frontend ładuje tylko biblioteki `maps`,
-`marker` i `geometry`. Brak klucza albo błąd Maps JavaScript API nie blokuje formularza ani tekstowego
-wyniku — zamiast mapy pojawia się kontrolowany komunikat.
+Advanced Markers require a map ID. `DEMO_MAP_ID` is for development only; a deployed frontend should supply its own `VITE_GOOGLE_MAP_ID`. The frontend loads only the `maps`, `marker`, and `geometry` libraries. A missing key or Maps JavaScript API failure does not block the form or text result; the map shows a controlled message instead.
 
-Manualny smoke test:
+Manual smoke test:
 
-1. Uruchom PostGIS/NATS, backend z oboma zmiennymi `GOOGLE_MAPS_API_KEY` i `FRONTEND_ORIGIN`,
-   a następnie frontend z powyższymi zmiennymi `VITE_*`.
-2. Otwórz `http://localhost:5173`.
-3. Kliknij `Use my location` albo wpisz współrzędne ręcznie, podaj adres i wyszukaj parking.
-4. Sprawdź markery origin/destination/parking, trasę DRIVE, podsumowanie DRIVE/WALK i ostrzeżenie
-   `walking_routes_beta`.
-5. Wykonaj drugi search i sprawdź, że markery oraz polilinia zostały zastąpione.
+1. Start PostGIS/NATS, the backend with `GOOGLE_MAPS_API_KEY` and `FRONTEND_ORIGIN`, then the frontend with the `VITE_*` settings above.
+2. Open `http://localhost:5173`.
+3. Choose “Use my location” or enter coordinates manually, provide an address, and search.
+4. Check the origin/destination/parking markers, DRIVE route, DRIVE/WALK summary, and `walking_routes_beta` warning.
+5. Search again and confirm that the markers and polyline are replaced.
 
-Google walking routes pozostają beta. Każdy klient prezentujący ich wynik musi pokazać zwrócone
-przez backend ostrzeżenie o możliwych brakach chodników i ścieżek pieszych.
+Google walking routes remain in beta. Every client presenting them must show the backend's warning about potentially missing sidewalks and paths.
 
-## Edge perception dla nagranego wideo
+## Edge Perception for Recorded Video
 
-Etap 7 dodaje alternatywnego producenta tego samego kontraktu zdarzeń; `camera-simulator` pozostaje
-dostępny do testowania backendu bez Computer Vision.
+Stage 7 adds an alternative producer of the same event contract. `camera-simulator` remains available to test the backend without computer vision.
 
 ```text
 recorded video
@@ -301,14 +336,11 @@ parking-ingestion-worker
 PostgreSQL
 ```
 
-`parking-perception` jest czystą biblioteką domenowej logiki CV. Nie zależy od NATS, GStreamer,
-ONNX Runtime, SQLx ani Axum. `parking-edge-agent` zawiera źródło klatek, adapter modelu,
-konfigurację, trwałą sekwencję i publikację.
+`parking-perception` is a pure library for CV domain logic. It has no dependency on NATS, GStreamer, ONNX Runtime, SQLx, or Axum. `parking-edge-agent` owns the frame source, model adapter, configuration, persistent sequence, and publishing.
 
-### Zależności systemowe i uruchomienie
+### System Dependencies and Startup
 
-Bindingi GStreamer 0.25.x wymagają Rust 1.92 oraz developerskich bibliotek GStreamer. Nazwy
-pakietów zależą od dystrybucji. Przykładowo na Debianie/Ubuntu są to między innymi:
+GStreamer 0.25.x bindings require Rust 1.92 and GStreamer development libraries. Package names vary by distribution. On Debian/Ubuntu, an example is:
 
 ```bash
 sudo apt install pkg-config libglib2.0-dev libgstreamer1.0-dev \
@@ -316,111 +348,72 @@ sudo apt install pkg-config libglib2.0-dev libgstreamer1.0-dev \
   gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav
 ```
 
-Na Fedorze odpowiednikami są zwykle `pkgconf-pkg-config`, `gstreamer1-devel`,
-`gstreamer1-plugins-base-devel` oraz potrzebne zestawy pluginów. Należy korzystać z pakietów
-systemowych danej dystrybucji.
+On Fedora, the equivalents are typically `pkgconf-pkg-config`, `gstreamer1-devel`, `gstreamer1-plugins-base-devel`, and the required plugin sets. Use your distribution's system packages.
 
-Skopiuj i dostosuj przykładową konfigurację. Lokalnego pliku, modelu, wideo i bazy stanu nie należy
-commitować:
+Copy and adapt the example configuration. Do not commit the local config, model, video, or state database:
 
 ```bash
 cp config/edge-camera.example.toml config/edge-camera.toml
 export NATS_URL=nats://127.0.0.1:4222
-export PARKING_MODEL_PATH=/absolute/path/to/parking-detector-v1.onnx # opcjonalny override
-export PARKING_VIDEO_PATH=/absolute/path/to/parking-camera.mp4 # opcjonalny override
+export PARKING_MODEL_PATH=/absolute/path/to/parking-detector-v1.onnx # optional override
+export PARKING_VIDEO_PATH=/absolute/path/to/parking-camera.mp4 # optional override
 cargo run -p parking-edge-agent -- --config config/edge-camera.toml
 ```
 
-Przed edge agentem uruchom NATS i `parking-ingestion-worker`, który provisionuje istniejący stream
-`PARKING_OBSERVATIONS`. Agent publikuje na istniejący subject `parking.observations.v1`, czeka na
-JetStream publish ACK i ustawia `Nats-Msg-Id` na nowe `event_id`. Model nie jest pobierany przy
-starcie; brak wskazanego pliku jest czytelnym błędem startupu. Domyślnym i jedynym wspieranym
-providerem Etapu 7 jest CPU. ORT jest ładowany dynamicznie, aby build i testy nie pobierały zależnej
-od platformy biblioteki binarnej. Przy uruchamianiu ustaw `ORT_DYLIB_PATH` na zgodną bibliotekę
-`libonnxruntime.so` (ONNX Runtime dla CPU); brak biblioteki powoduje kontrolowany błąd startupu.
+Start NATS and `parking-ingestion-worker` before the edge agent; the worker provisions the `PARKING_OBSERVATIONS` stream. The agent publishes to the existing `parking.observations.v1` subject, waits for the JetStream publish ACK, and uses the new `event_id` as `Nats-Msg-Id`. It does not download a model at startup; a missing model file is a clear startup error. CPU is the default and only supported provider for Stage 7. ONNX Runtime is loaded dynamically so builds and tests do not download a platform-specific binary. At runtime, point `ORT_DYLIB_PATH` to a compatible CPU `libonnxruntime.so`; a missing library produces a controlled startup error.
 
-### Algorytm occupancy i stabilizacja
+### Occupancy and Stabilization Algorithm
 
-ROI miejsc oraz bounding boxy używają współrzędnych znormalizowanych `0..=1`. Dla każdej detekcji,
-której `class_id` znajduje się w konfigurowanym `vehicle_class_ids` i której confidence przekracza
-próg, liczony jest:
+Spot ROIs and bounding boxes use normalized coordinates in `0..=1`. For each detection whose `class_id` is in the configured `vehicle_class_ids` and whose confidence clears the threshold, the engine computes:
 
 ```text
 spot_overlap_ratio = intersection_area(spot_polygon, vehicle_bbox) / spot_polygon_area
 occupancy_score = max(detection.confidence * spot_overlap_ratio)
 ```
 
-To celowo nie jest klasyczne IoU. Wynik `<= free_threshold` oznacza `Free`, wynik
-`>= occupied_threshold` oznacza `Occupied`, a martwa strefa między progami oznacza `Uncertain`.
-Brak pasującej detekcji daje score `0`, ale wyłącznie dla poprawnie przetworzonej klatki.
+This deliberately is not conventional IoU. A score `<= free_threshold` means `Free`; `>= occupied_threshold` means `Occupied`; the gap between thresholds means `Uncertain`. No matching detection gives score 0, but only for a frame processed successfully.
 
-Inferencja wykonywana jest najwyżej co `sample_interval_ms`. Nowa klasyfikacja staje się stabilna
-dopiero po `stable_samples_required` kolejnych zgodnych próbkach. Event powstaje natychmiast po
-zmianie stabilnego stanu albo, bez zmiany, gdy od poprzedniej emisji upłynął
-`observation_refresh_interval_ms`. Walidacja wymaga, aby refresh był krótszy od backendowego TTL
-15 s; przykład używa 5 s.
+Inference runs at most once per `sample_interval_ms`. A classification becomes stable after `stable_samples_required` consecutive matching samples. An event is emitted immediately when the stable state changes, or after `observation_refresh_interval_ms` without a change. Validation requires the refresh interval to be shorter than the backend's 15-second TTL; the example uses 5 seconds.
 
-Wartości przykładowe: confidence `0.50`, free `0.10`, occupied `0.30`, sampling `500 ms` i trzy
-stabilne próbki są wyłącznie początkowymi parametrami eksperymentalnymi. Nie są naukowo optymalne;
-docelowo należy je skalibrować na oznaczonym zbiorze walidacyjnym i zgodnie z label map konkretnego
-modelu. Przykładowe ID klas `[2, 3, 5, 7]` również muszą zostać dopasowane do label map modelu.
+Example values—confidence `0.50`, free `0.10`, occupied `0.30`, 500 ms sampling, and three stable samples—are starting experimental parameters, not scientifically optimal settings. I still need to calibrate them against labeled validation data and the chosen model's label map. The example class IDs `[2, 3, 5, 7]` must likewise match that model's label map.
 
-### Kontrakt modelu ParkingDetectorV1
+### ParkingDetectorV1 Model Contract
 
-Adapter nie deklaruje zgodności z dowolnym surowym eksportem YOLO. Obsługuje dokładnie model po NMS:
+The adapter does not claim compatibility with an arbitrary raw YOLO export. It accepts a post-NMS model with this exact contract:
 
 ```text
-input:  float32 [1, 3, H, W], RGB, CHW, wartości [0,1]
+input:  float32 [1, 3, H, W], RGB, CHW, values [0,1]
 output: float32 [N, 6]
 row:    [x_min, y_min, x_max, y_max, confidence, class_id]
-bbox:   współrzędne znormalizowane względem oryginalnej klatki
+bbox:   coordinates normalized to the original frame
 ```
 
-Preprocessing przyjmuje spakowany RGB z GStreamer, wykonuje jawny nearest-neighbor stretch resize
-do `input_width` × `input_height`, normalizację `[0,255] -> [0,1]`, HWC -> CHW i dodaje batch.
-Stretch jest świadomym ograniczeniem MVP: może zniekształcić proporcje. Ponieważ wejście i output
-są normalizowane w obu osiach niezależnie, bbox nie wymaga transformacji letterbox. Surowy YOLO
-wymagający dekodowania anchors, mapowania tensorów lub NMS potrzebuje osobnego postprocessora.
-Niepoprawne bboxy, confidence lub class ID z modelu kończą inferencję tej klatki kontrolowanym
-błędem bez panic. Brak detekcji w poprawnym output `[0,6]` jest odrębnym przypadkiem.
+Preprocessing takes packed RGB from GStreamer, applies explicit nearest-neighbor stretch resizing to `input_width` × `input_height`, normalizes `[0,255] -> [0,1]`, converts HWC to CHW, and adds a batch dimension. Stretching is a deliberate MVP limitation and can distort aspect ratios. Because both input and output axes are normalized independently, bounding boxes need no letterbox transform. Raw YOLO output that requires anchor decoding, tensor mapping, or NMS needs a separate postprocessor. Invalid model boxes, confidence, or class IDs fail the frame's inference without panicking. A valid empty `[0,6]` output is a distinct case.
 
-### Failure i restart semantics
+### Failure and Restart Semantics
 
-- Brak/zatrzymanie wideo nie tworzy `Free`: nie ma eventu, refresh ustaje, a backend po TTL przechodzi
-  do `UNKNOWN`.
-- Błąd pojedynczej inferencji jest logowany i nie aktualizuje stabilizatora. Długotrwały błąd także
-  kończy się brakiem refreshu i backendowym `UNKNOWN`.
-- Stabilne `Uncertain` jest jawnie publikowane; backend mapuje je na `UNKNOWN` zamiast utrzymywać
-  poprzedni stan w nieskończoność.
-- Publish jest ponawiany maksymalnie pięć razy z opóźnieniami 100/200/400/800 ms przed piątą próbą.
-  Trwały outage jest logowany, a analiza może być kontynuowana; Etap 7 nie ma offline spoolera.
-- EOF kończy pipeline bez zapętlania i zamyka GStreamer. Ctrl+C jest obsługiwane między operacjami;
-  oczekiwanie na klatkę ma limit 5 s, więc zastoju źródła nie traktujemy jako końca pliku.
-- Brak/niezgodność pliku modelu przerywa startup zamiast pozorować działanie.
+- Missing or stopped video does not create `Free` events. Refresh stops, and the backend changes stale state to `UNKNOWN` after its TTL.
+- A single inference error is logged without updating the stabilizer. A prolonged error also stops refresh and ultimately produces backend `UNKNOWN`.
+- Stable `Uncertain` is explicitly published and mapped to `UNKNOWN` rather than preserving the previous state indefinitely.
+- Publishing is retried at most five times, with 100/200/400/800 ms delays before the fifth attempt. A lasting outage is logged; Stage 7 has no offline spool.
+- EOF ends the pipeline and closes GStreamer. SIGINT/SIGTERM is handled between operations; a frame wait is capped at 5 seconds, so a stalled source is not mistaken for EOF. Shutdown has an overall 15-second limit.
+- A missing or incompatible model file stops startup instead of simulating a healthy agent.
 
-Camera-wide `sequence` jest zapisywany w lokalnym SQLite wskazanym przez `state_database`. Numer jest
-alokowany i commitowany przed pierwszą próbą publikacji. Po restarcie następny numer jest większy od
-każdego wcześniej zaalokowanego. Nieudana publikacja może pozostawić lukę, ale numer nigdy nie jest
-używany ponownie — backend wymaga monotoniczności, nie ciągłości.
+A camera-wide `sequence` is persisted in the local SQLite file named by `state_database`. Each number is allocated and committed before the first publish attempt. After a restart, the next number exceeds every number previously allocated. A failed publish may leave a gap, but numbers are never reused: the backend requires monotonicity, not continuity.
 
-Edge nie publikuje klatek, cropów, twarzy ani tablic rejestracyjnych. Do NATS trafia wyłącznie
-`SpotObservationV1` z metadanymi occupancy.
+The edge agent publishes no frames, crops, faces, or license plates. Only `SpotObservationV1` occupancy metadata goes to NATS.
 
-Test GStreamer oparty na `videotestsrc` jest domyślnie ignorowany, ponieważ wymaga bibliotek i
-pluginów systemowych. Po ich instalacji uruchom:
+The `videotestsrc` GStreamer test is ignored by default because it needs system libraries and plugins. After installing them, run:
 
 ```bash
 cargo test -p parking-edge-agent gstreamer_pipeline_produces_rgb_frames -- --ignored
 ```
 
-Opcjonalny live smoke wymaga kompatybilnego modelu `ParkingDetectorV1`, lokalnego pliku wideo,
-działającego workera i poprawnie skonfigurowanych ROI. Duże pliki `.onnx`, `.mp4`, katalog
-`artifacts/`, lokalna konfiguracja oraz `edge-state.db*` są ignorowane przez Git.
+An optional live smoke test requires a compatible `ParkingDetectorV1` model, a local video, a running worker, and correctly configured ROIs. Large `.onnx` and `.mp4` files, `artifacts/`, local config, and `edge-state.db*` are ignored by Git.
 
-## Testy i kontrola jakości
+## Tests and Quality Checks
 
-PostGIS i NATS z Compose muszą działać. Testy integracyjne wykonują prawdziwe zapytania do
-obu usług.
+Domain tests, Postgres/NATS integration tests, Google adapter HTTP mocks, frontend tests, perception tests, edge tests, and evaluator tests cover different layers. GStreamer infrastructure tests are ignored by default and run explicitly where system libraries are available. PostGIS and NATS from Compose are required for the full integration path. The automated tests make no paid Google calls and need neither a real ONNX model nor a real video; real-data validation is separate work.
 
 ```bash
 export DATABASE_URL=postgres://parking:parking@localhost:5432/parking
@@ -435,32 +428,15 @@ npm test
 npm run build
 ```
 
-## Założenie MVP
+## MVP Assumption
 
-Jedno miejsce parkingowe ma jedno autorytatywne źródło obserwacji w danym czasie. System nie
-implementuje sensor fusion ani rozbudowanego ownership kamer. `sequence` ustala kolejność
-zdarzeń, a `observed_at` służy wyłącznie do oceny świeżości obserwacji.
+I currently assume one authoritative observation source per parking spot at a time. The system does not implement sensor fusion or advanced camera ownership. `sequence` determines event ordering; `observed_at` determines observation freshness only.
 
-## Perception evaluation
+## Perception Evaluation
 
-Etap 7.1 używa osobnego `perception-evaluator`: czyta wcześniej zapisane detekcje i niezależny
-ground truth, a scoring ROI i stabilizację wykonuje przez ten sam crate `parking-perception` co
-edge. Nie uruchamia ONNX ani nie zmienia konfiguracji produkcyjnej. Najpierw wygeneruj
-`detections.jsonl` raz przy ustalonej częstości próbkowania, przygotuj niezależne
-`ground_truth.jsonl`, a następnie uruchamiaj wiele porównań progów na tych samych danych.
-Generowanie dumpu detekcji z wideo opisuje sekcja „Real-data evaluation workflow” poniżej.
+Stage 7.1 uses a separate `perception-evaluator`. It reads previously recorded detections and independent ground truth, while reusing the same `parking-perception` crate for ROI scoring and stabilization as the edge agent. It does not run ONNX or change runtime configuration. Generate `detections.jsonl` once at a fixed sampling cadence, prepare independent `ground_truth.jsonl`, then compare multiple threshold settings against those same inputs. The “Real-Data Evaluation Workflow” below covers detection generation from video.
 
-Manifest `dataset.toml` ma `schema_version = 1`, nazwę, wersję, opis i listę `[[videos]]`
-z `video_id`, `camera_id`, `detections_path`, `ground_truth_path` i
-`roi_config_path`. Ścieżki są względne wobec manifestu. ROI wskazuje zwykłą konfigurację
-edge (te same `[[spots]]`, `polygon`, `vehicle_class_ids` i refresh interval).
-Każdy wiersz JSONL ma `schema_version: 1`. Detekcja zawiera `video_id`, `camera_id`,
-`frame_index`, `timestamp_ms` i listę detekcji z `class_id`, `confidence` oraz
-znormalizowanym bbox (`x_min`, `y_min`, `x_max`, `y_max`). Ground truth zawiera
-`video_id`, `spot_id`, `timestamp_ms` i `state`: `free`, `occupied` lub `unknown`.
-Mały syntetyczny przykład jest w `fixtures/perception-eval/`; nie jest reprezentatywnym
-zbiorem parkingowym. Dużych filmów, klatek i dumpów nie commitujemy
-(`datasets/raw/`, `datasets/generated/`, `evaluation-output/` są ignorowane).
+The `dataset.toml` manifest contains `schema_version = 1`, name, version, description, and `[[videos]]` entries with `video_id`, `camera_id`, `detections_path`, `ground_truth_path`, and `roi_config_path`. Paths are relative to the manifest. The ROI file points to an ordinary edge configuration using the same `[[spots]]`, `polygon`, `vehicle_class_ids`, and refresh interval. Each JSONL row has `schema_version: 1`. A detection row contains `video_id`, `camera_id`, `frame_index`, `timestamp_ms`, and detections with `class_id`, `confidence`, and a normalized bounding box (`x_min`, `y_min`, `x_max`, `y_max`). Ground truth contains `video_id`, `spot_id`, `timestamp_ms`, and a `free`, `occupied`, or `unknown` state. The small synthetic example in `fixtures/perception-eval/` is not a representative parking dataset. Do not commit large videos, frames, or dumps; `datasets/raw/`, `datasets/generated/`, and `evaluation-output/` are ignored.
 
 ```bash
 cargo run -p perception-evaluator -- evaluate \
@@ -477,49 +453,26 @@ cargo run -p perception-evaluator -- sweep \
   --stable-samples-values 2,3,4
 ```
 
-Dostępne są `--ground-truth-tolerance-ms` (domyślnie 250) i
-`--transition-timeout-ms` (domyślnie 10000). Etykieta jest dopasowana po
-`video_id + spot_id + najbliższy timestamp`; remis rozstrzyga wcześniejsza adnotacja.
-Nieoznaczone próbki i `unknown` są raportowane, ale wyłączone z klasyfikacji.
-`Unknown` przerywa ciąg znanych etykiet przy wykrywaniu transitions — zmiana przez lukę
-unknown nie ma przypisanej dokładnej latencji. Pierwsze próbki bez ustalonego stanu stabilnego
-są oceniane jako prediction `UNCERTAIN`.
+`--ground-truth-tolerance-ms` defaults to 250, and `--transition-timeout-ms` to 10000. Labels are matched by `video_id + spot_id + nearest timestamp`, breaking ties with the earlier annotation. Unlabeled and `unknown` samples are reported but excluded from classification. `Unknown` breaks a run of known labels when detecting transitions, so a change across an unknown gap has no exact latency. Initial samples without a stable state are scored as `UNCERTAIN` predictions.
 
-`results.csv` ma jeden wiersz na poprawną konfigurację z oddzielnymi kolumnami `frame_*`
-i metrykami stanu stabilnego. `per_camera.csv` ma przekrój dla każdej kamery. `summary.json` zawiera
-wersję schematu, balans klas, metryki frame/stabilized dla pojedynczej ewaluacji lub wybranej
-konfiguracji, metryki per-camera, SHA-256 wejść i liczbę pominiętych kombinacji.
-`evaluation-config.json` zapisuje wszystkie parametry. Dla pełnej powtarzalności
-`evaluation_timestamp` jest domyślnie `null`; można podać jawny znacznik RFC3339 przez
-`--evaluation-timestamp 2026-01-01T00:00:00Z`.
+`results.csv` has one row per valid configuration with separate `frame_*` and stabilized-state metrics. `per_camera.csv` breaks results down by camera. `summary.json` contains the schema version, class balance, frame/stabilized metrics for an evaluation or selected sweep configuration, per-camera metrics, input SHA-256 hashes, and a count of skipped combinations. `evaluation-config.json` records every parameter. For reproducibility, `evaluation_timestamp` defaults to `null`; pass an explicit RFC3339 time with `--evaluation-timestamp 2026-01-01T00:00:00Z` if needed.
 
-Analizuj przede wszystkim false-free (zajęte miejsce błędnie pokazane jako wolne), coverage,
-F1 obu klas oraz latencję zmian. `UNCERTAIN` zmniejsza coverage, ale szerszy obszar
-niepewności może ograniczyć kosztowne błędne decyzje. Strict accuracy jest pomocnicza i
-może mylić przy niezbalansowanych klasach. Bez limitów narzędzie nie wskazuje zwycięzcy;
-`--max-false-free-rate` i/lub `--min-coverage` włączają jawny wybór najwyższego macro F1
-spośród konfiguracji spełniających ograniczenia. Limitów nie narzucamy z góry.
+I prioritize false-free errors (an occupied spot shown as free), coverage, both classes' F1 scores, and transition latency. `UNCERTAIN` lowers coverage but a wider uncertainty band may prevent costly false decisions. Strict accuracy is secondary and can mislead on imbalanced data. Without constraints, the tool does not name a winner; `--max-false-free-rate` and/or `--min-coverage` enable an explicit choice of the highest macro F1 among configurations that satisfy the limits. I do not impose those limits in advance.
 
-Wynik sweep dotyczy tylko użytego datasetu i cadence detekcji, nie jest globalnie
-najlepszym zestawem progów. Strojenie i końcowy raport na tych samych danych zawyżają ocenę:
-docelowo należy mieć oddzielny zbiór kalibracyjny/walidacyjny oraz held-out test.
+A sweep result applies only to its dataset and detection cadence; it is not a globally optimal threshold set. Tuning and reporting on the same data would inflate the evaluation. I ultimately need separate calibration/validation data and a held-out test set.
 
-## Real-data evaluation workflow
+## Real-Data Evaluation Workflow
 
-Etap 7.2A łączy istniejące elementy:
+Stage 7.2A connects existing components:
 
 ```text
 recorded video -> GStreamer -> frame sampling -> existing OnnxDetector
                -> raw Detection[] -> detections.jsonl -> perception-evaluator
 ```
 
-1. Przygotuj model zgodny **dokładnie** z kontraktem `ParkingDetectorV1` opisanym wyżej
-   (wejście float32 `[1,3,H,W]`, RGB/CHW/stretch, output float32 `[N,6]` po NMS).
-   Nie wystarczy dowolny eksport YOLO ONNX.
-2. Przygotuj lokalny plik nagrania. Model i film mogą znajdować się poza repozytorium;
-   do uruchomienia potrzebna jest także lokalna biblioteka CPU ONNX Runtime wskazana przez
-   `ORT_DYLIB_PATH`.
-3. Wygeneruj detekcje jednokrotnie:
+1. Prepare a model that matches the `ParkingDetectorV1` contract above **exactly** (float32 `[1,3,H,W]` input, RGB/CHW/stretch, post-NMS float32 `[N,6]` output). An arbitrary YOLO ONNX export is not enough.
+2. Prepare a local recording. The model and video may live outside the repository. You also need a local CPU ONNX Runtime library selected by `ORT_DYLIB_PATH`.
+3. Generate detections once:
 
 ```bash
 export ORT_DYLIB_PATH=/path/to/libonnxruntime.so
@@ -533,25 +486,14 @@ cargo run -p perception-evaluator -- generate-detections \
   --output datasets/real-run-001/detections.jsonl
 ```
 
-Można zamiast ścieżek i parametrów użyć `--config config/edge-camera.toml` z istniejącym
-formatem edge; `--video-id` i `--output` nadal są wymagane. Precedence:
-jawne argumenty CLI > `PARKING_MODEL_PATH`/`PARKING_VIDEO_PATH` > edge config;
-bez configu domyślny sampling to 500 ms i rozmiar wejścia 640×640.
-`--detector-output-floor` ma domyślnie 0.0 i nie jest produkcyjnym
-`detection_confidence_threshold`. Generator nie filtruje `vehicle_class_ids`:
-zachowuje wszystkie klasy i niskie confidence, żeby późniejszy sweep nie wymagał ponownej
-inferencji. `--force` jawnie zezwala na zastąpienie istniejącego outputu; domyślnie
-nadpisanie jest zabronione.
+You may use `--config config/edge-camera.toml` instead of separate paths and parameters. `--video-id` and `--output` are still required. Precedence is explicit CLI flags > `PARKING_MODEL_PATH`/`PARKING_VIDEO_PATH` > edge config; without a config, sampling defaults to 500 ms and input dimensions to 640×640. `--detector-output-floor` defaults to 0.0 and is not the runtime `detection_confidence_threshold`. The generator does not filter `vehicle_class_ids`; it retains every class and low-confidence detection so a later sweep needs no repeat inference. Overwriting is refused by default; `--force` permits it explicitly.
 
-4. Przygotuj niezależne, ręcznie lub zewnętrznie oznaczone `ground_truth.jsonl` na poziomie
-   spot + timestamp. Generator nie tworzy ground truth.
-5. Utwórz/zaktualizuj `dataset.toml` w formacie Etapu 7.1, wskazując wygenerowany JSONL,
-   ground truth i tę samą konfigurację ROI.
-6. Uruchom `evaluate`, następnie osobno `sweep` z przykładu powyżej.
-7. Analizuj false-free, coverage, F1 obu klas i latencję zmian; nie wybieraj progów na
-   podstawie samego accuracy.
+4. Prepare independent `ground_truth.jsonl` labels at spot-and-timestamp level, manually or through an external process. The generator does not create ground truth.
+5. Create or update a Stage 7.1 `dataset.toml` pointing to the generated JSONL, ground truth, and the same ROI configuration.
+6. Run `evaluate`, then a separate `sweep` using the earlier examples.
+7. Analyze false-free rate, coverage, both F1 scores, and transition latency; do not choose thresholds using accuracy alone.
 
-Sugerowany układ:
+Suggested layout:
 
 ```text
 datasets/real-run-001/
@@ -561,33 +503,13 @@ datasets/real-run-001/
 └── ground_truth.jsonl
 ```
 
-Każdy rekord JSONL ma `schema_version: 1`; `frame_index` oznacza kolejny **zapisany
-sample** od 0, nie indeks klatki źródłowej. `timestamp_ms` pochodzi z GStreamer PTS
-(czas prezentacji wideo), nie z zegara systemowego. Brak PTS lub cofnięcie PTS jest
-błędem — nie ma fallbacku do wall clock. Ten sam film i sample interval dają te same
-rekordy przy deterministycznym modelu. `detections-metadata.json` zapisuje nazwę
-i SHA-256 modelu oraz wideo, kontrakt, rozmiar wejścia, cadence, output floor,
-czas uruchomienia i liczbę rekordów. Pole `generated_at` oraz czas wykonania są
-naturalnie różne między uruchomieniami; sam `detections.jsonl` jest artefaktem
-do porównywania i ponownej ewaluacji.
+Each JSONL record has `schema_version: 1`. `frame_index` counts **saved samples** from 0, not source-video frames. `timestamp_ms` comes from GStreamer PTS (video presentation time), not wall time. Missing or decreasing PTS is an error; there is no wall-clock fallback. With a deterministic model, the same video and sampling interval produce the same records. `detections-metadata.json` records the model and video names and SHA-256 hashes, contract, input size, cadence, output floor, generation time, and record count. `generated_at` and execution time naturally vary between runs; `detections.jsonl` is the artifact intended for comparison and reevaluation.
 
-Zapis jest strumieniowy do `detections.jsonl.tmp`. Dopiero poprawny EOF, flush,
-zapis metadata i rename publikują finalny plik. Brak modelu/wideo/ORT, niezgodny
-kontrakt modelu, błąd inferencji, nieprawidłowy output modelu lub błąd zapisu
-kończą generowanie błędem bez udawania kompletnego datasetu. Polityka badawcza
-jest tu **fail-fast**, inaczej niż runtime edge, który może pominąć błędną klatkę.
-Generator nie łączy się z NATS ani PostgreSQL, nie używa SQLite sequence i nie
-publikuje `SpotObservationV1`; nie uruchamia też `evaluate` automatycznie.
+Output streams to `detections.jsonl.tmp`. Only a successful EOF, flush, metadata write, and rename publish the final file. Missing model/video/ORT, an incompatible model contract, inference failure, invalid model output, or a write error fails generation rather than presenting an incomplete dataset as complete. This research workflow is intentionally **fail-fast**, unlike the edge runtime, which can skip a bad frame. The generator does not connect to NATS or PostgreSQL, use SQLite sequences, publish `SpotObservationV1`, or automatically run `evaluate`.
 
-`detections.jsonl` opisuje obecność i położenie obiektów, ale nie zawiera surowych
-klatek, cropów, twarzy ani tablic. Artefakty nie są automatycznie przesyłane do
-chmury; duże dane i modele pozostają poza Git. Testy fake source/fake detector
-oraz syntetyczny GStreamer pozwalają sprawdzić pipeline bez realnego modelu
-i nagrania. Etap 7.2A przygotowuje real-data pipeline, lecz nie potwierdza jeszcze
-jakości ani poprawności konkretnego modelu na rzeczywistym nagraniu.
+`detections.jsonl` describes object presence and location, not raw frames, crops, faces, or license plates. Artifacts are not automatically uploaded to the cloud; large data and models stay out of Git. Fake-source/fake-detector and synthetic GStreamer tests exercise the pipeline without a real model or recording. Stage 7.2A prepares a real-data workflow but does **not** validate a particular model's quality or correctness on real footage.
 
-Test syntetycznej ścieżki GStreamer → fake detector → JSONL (wymaga bibliotek i pluginów
-GStreamer, domyślnie ignorowany):
+Synthetic GStreamer → fake detector → JSONL test (requires GStreamer libraries and plugins; ignored by default):
 
 ```bash
 cargo test -p perception-evaluator gstreamer_synthetic_source_generates_jsonl -- --ignored

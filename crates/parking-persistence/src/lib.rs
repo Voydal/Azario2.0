@@ -1,4 +1,4 @@
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, time::Duration as StdDuration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -16,6 +16,21 @@ pub struct ParkingRepository {
     pool: PgPool,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct PoolConfig {
+    pub max_connections: u32,
+    pub acquire_timeout: StdDuration,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: 10,
+            acquire_timeout: StdDuration::from_secs(2),
+        }
+    }
+}
+
 impl ParkingRepository {
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
@@ -23,8 +38,16 @@ impl ParkingRepository {
     }
 
     pub async fn connect(database_url: &str) -> Result<Self, sqlx::Error> {
+        Self::connect_with_config(database_url, PoolConfig::default()).await
+    }
+
+    pub async fn connect_with_config(
+        database_url: &str,
+        config: PoolConfig,
+    ) -> Result<Self, sqlx::Error> {
         let pool = PgPoolOptions::new()
-            .max_connections(10)
+            .max_connections(config.max_connections)
+            .acquire_timeout(config.acquire_timeout)
             .connect(database_url)
             .await?;
         Ok(Self::new(pool))

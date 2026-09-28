@@ -1,9 +1,15 @@
-use std::{env, net::SocketAddr, sync::Arc, time::Duration as StdDuration};
+use std::{
+    env,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration as StdDuration, Instant},
+};
 
 use axum::{
     Json, Router,
-    extract::{Query, State, rejection::JsonRejection},
-    http::{HeaderValue, Method, StatusCode, header::CONTENT_TYPE},
+    extract::{Query, Request, State, rejection::JsonRejection},
+    http::{HeaderName, HeaderValue, Method, StatusCode, header::CONTENT_TYPE},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -11,7 +17,7 @@ use chrono::{DateTime, Utc};
 use google_maps_adapter::GoogleMapsClient;
 use parking_domain::{CameraId, EventId, ObservedState, ParkingSpotId, SpotObservation};
 use parking_persistence::{
-    CreateParkingSpotResult, ParkingRepository, RepositoryError, StoreObservationResult,
+    CreateParkingSpotResult, ParkingRepository, PoolConfig, RepositoryError, StoreObservationResult,
 };
 use parking_search::{
     Coordinate, DEFAULT_OBSERVATION_TTL, ExternalServiceError, FindParking, FindParkingConfig,
@@ -20,6 +26,8 @@ use parking_search::{
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
+use tracing::{info, warn};
+use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 const MAX_SEARCH_RADIUS_METERS: f64 = 5_000.0;
@@ -27,45 +35,172 @@ const DEFAULT_GOOGLE_MAPS_HTTP_TIMEOUT_MS: u64 = 3_000;
 const DEFAULT_PARKING_SEARCH_RADIUS_M: u32 = 800;
 const DEFAULT_PARKING_CANDIDATE_LIMIT: u32 = 25;
 const MAX_PARKING_CANDIDATE_LIMIT: u32 = 625;
+const DEFAULT_DATABASE_CHECK_TIMEOUT_MS: u64 = 1500;
+const DEFAULT_DATABASE_OPERATION_TIMEOUT_MS: u64 = 5000;
+const DEFAULT_SEARCH_TIMEOUT_MS: u64 = 15000;
+const DEFAULT_DATABASE_ACQUIRE_TIMEOUT_MS: u64 = 2000;
+const DEFAULT_DATABASE_MAX_CONNECTIONS: u32 = 10;
+const SHUTDOWN_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let log_format = init_logging()?;
+    let mut args = env::args().skip(1);
+    let migrate = match (args.next().as_deref(), args.next()) {
+        (None, None) => false,
+        (Some("migrate"), None) => true,
+        _ => return Err("usage: parking-api [migrate]".into()),
+    };
     let database_url = env::var("DATABASE_URL")
         .map_err(|_| "DATABASE_URL must be set before starting parking-api")?;
-    let repository = ParkingRepository::connect(&database_url).await?;
-    repository.migrate().await?;
+    let max_connections =
+        environment_u32("DATABASE_MAX_CONNECTIONS", DEFAULT_DATABASE_MAX_CONNECTIONS)?;
+    let acquire_timeout_ms = environment_u64(
+        "DATABASE_ACQUIRE_TIMEOUT_MS",
+        DEFAULT_DATABASE_ACQUIRE_TIMEOUT_MS,
+    )?;
+    let check_timeout_ms = environment_u64(
+        "DATABASE_CHECK_TIMEOUT_MS",
+        DEFAULT_DATABASE_CHECK_TIMEOUT_MS,
+    )?;
+    let operation_timeout_ms = environment_u64(
+        "DATABASE_OPERATION_TIMEOUT_MS",
+        DEFAULT_DATABASE_OPERATION_TIMEOUT_MS,
+    )?;
+    let search_timeout_ms =
+        environment_u64("PARKING_SEARCH_TIMEOUT_MS", DEFAULT_SEARCH_TIMEOUT_MS)?;
+    if max_connections == 0
+        || acquire_timeout_ms == 0
+        || check_timeout_ms == 0
+        || operation_timeout_ms == 0
+        || search_timeout_ms == 0
+    {
+        return Err("database pool size and timeouts must be positive".into());
+    }
+    let repository = ParkingRepository::connect_with_config(
+        &database_url,
+        PoolConfig {
+            max_connections,
+            acquire_timeout: StdDuration::from_millis(acquire_timeout_ms),
+        },
+    )
+    .await
+    .map_err(|_| "database connection failed")?;
+    if migrate {
+        repository.migrate().await?;
+        info!(
+            service = "parking-api",
+            event = "migration_complete",
+            "database migrations applied"
+        );
+        return Ok(());
+    }
     let parking_search = build_parking_search(&repository)?;
-    let frontend_origin = env::var("FRONTEND_ORIGIN")
-        .unwrap_or_else(|_| "http://localhost:5173".into())
-        .parse::<HeaderValue>()?;
-
-    let address = SocketAddr::from(([0, 0, 0, 0], 3000));
+    let frontend_origin =
+        env::var("FRONTEND_ORIGIN").unwrap_or_else(|_| "http://localhost:5173".into());
+    let parsed_origin = reqwest::Url::parse(&frontend_origin)
+        .map_err(|_| "FRONTEND_ORIGIN must be an absolute HTTP(S) URL")?;
+    if !matches!(parsed_origin.scheme(), "http" | "https") || parsed_origin.host().is_none() {
+        return Err("FRONTEND_ORIGIN must be an absolute HTTP(S) URL".into());
+    }
+    let frontend_origin = frontend_origin.parse::<HeaderValue>()?;
+    let address: SocketAddr = env::var("API_BIND_ADDRESS")
+        .unwrap_or_else(|_| "0.0.0.0:3000".into())
+        .parse()
+        .map_err(|_| "API_BIND_ADDRESS must be a valid IP:port socket address")?;
     let listener = TcpListener::bind(address).await?;
-
-    println!("parking-api listening on http://{address}");
+    info!(service = "parking-api", version = env!("CARGO_PKG_VERSION"), log_format,
+        bind_address = %address, event = "startup", "API listening");
     axum::serve(
         listener,
         app(
             AppState {
                 repository,
                 parking_search,
+                database_check_timeout: StdDuration::from_millis(check_timeout_ms),
+                database_operation_timeout: StdDuration::from_millis(operation_timeout_ms),
+                search_timeout: StdDuration::from_millis(search_timeout_ms),
             },
             frontend_origin,
         ),
     )
+    .with_graceful_shutdown(shutdown_signal())
     .await?;
+    info!(
+        service = "parking-api",
+        event = "shutdown_complete",
+        "API stopped"
+    );
     Ok(())
+}
+
+fn init_logging() -> Result<&'static str, Box<dyn std::error::Error>> {
+    let format = env::var("LOG_FORMAT").unwrap_or_else(|_| "pretty".into());
+    let filter = match env::var("RUST_LOG") {
+        Ok(value) => EnvFilter::try_new(value)?,
+        Err(env::VarError::NotPresent) => EnvFilter::new("info"),
+        Err(error) => return Err(error.into()),
+    };
+    match format.as_str() {
+        "json" => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .json()
+            .init(),
+        "pretty" => tracing_subscriber::fmt().with_env_filter(filter).init(),
+        _ => return Err("LOG_FORMAT must be json or pretty".into()),
+    }
+    Ok(if format == "json" { "json" } else { "pretty" })
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+        match terminate {
+            Ok(mut terminate) => tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = terminate.recv() => {},
+            },
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+    info!(
+        service = "parking-api",
+        event = "shutdown_requested",
+        "stopping new requests"
+    );
+    tokio::spawn(async {
+        tokio::time::sleep(SHUTDOWN_TIMEOUT).await;
+        tracing::error!(
+            service = "parking-api",
+            event = "shutdown_timeout",
+            "graceful shutdown timed out"
+        );
+        std::process::exit(1);
+    });
 }
 
 #[derive(Clone)]
 struct AppState {
     repository: ParkingRepository,
     parking_search: Option<Arc<FindParking>>,
+    database_check_timeout: StdDuration,
+    database_operation_timeout: StdDuration,
+    search_timeout: StdDuration,
 }
 
 fn app(state: AppState, frontend_origin: HeaderValue) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/health/live", get(health_live))
+        .route("/health/ready", get(health_ready))
+        .route("/version", get(version))
         .route("/v1/parking-spots", post(create_parking_spot))
         .route("/v1/observations", post(create_observation))
         .route("/v1/parking-spots/free", get(find_free_parking_spots))
@@ -75,8 +210,98 @@ fn app(state: AppState, frontend_origin: HeaderValue) -> Router {
             CorsLayer::new()
                 .allow_origin(frontend_origin)
                 .allow_methods([Method::GET, Method::POST])
-                .allow_headers([CONTENT_TYPE]),
+                .allow_headers([CONTENT_TYPE, HeaderName::from_static("x-request-id")])
+                .expose_headers([HeaderName::from_static("x-request-id")]),
         )
+        .layer(middleware::from_fn(request_id_middleware))
+}
+
+async fn request_id_middleware(request: Request, next: Next) -> Response {
+    let request_id = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .unwrap_or_else(Uuid::new_v4);
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let started = Instant::now();
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        "x-request-id",
+        HeaderValue::from_str(&request_id.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("invalid")),
+    );
+    info!(service = "parking-api", event = "http_request", %request_id, %method, %path,
+        status = response.status().as_u16(), duration_ms = started.elapsed().as_millis() as u64,
+        "request completed");
+    response
+}
+
+#[derive(Serialize)]
+struct HealthResponse {
+    status: &'static str,
+}
+
+async fn health_live() -> Json<HealthResponse> {
+    Json(HealthResponse { status: "ok" })
+}
+
+#[derive(Serialize)]
+struct ReadinessResponse {
+    status: &'static str,
+    checks: ReadinessChecks,
+}
+
+#[derive(Serialize)]
+struct ReadinessChecks {
+    database: &'static str,
+}
+
+async fn health_ready(State(state): State<AppState>) -> (StatusCode, Json<ReadinessResponse>) {
+    let check = tokio::time::timeout(state.database_check_timeout, async {
+        sqlx::query("SELECT 1")
+            .execute(state.repository.pool())
+            .await
+    })
+    .await;
+    let ready = matches!(check, Ok(Ok(_)));
+    if !ready {
+        warn!(
+            service = "parking-api",
+            event = "readiness_failure",
+            dependency = "database",
+            "database unavailable"
+        );
+    }
+    (
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(ReadinessResponse {
+            status: if ready { "ok" } else { "not_ready" },
+            checks: ReadinessChecks {
+                database: if ready { "ok" } else { "unavailable" },
+            },
+        }),
+    )
+}
+
+#[derive(Serialize)]
+struct VersionResponse {
+    service: &'static str,
+    version: &'static str,
+    git_sha: Option<&'static str>,
+}
+
+async fn version() -> Json<VersionResponse> {
+    Json(VersionResponse {
+        service: "parking-api",
+        version: env!("CARGO_PKG_VERSION"),
+        git_sha: option_env!("PARKING_GIT_SHA"),
+    })
 }
 
 fn build_parking_search(
@@ -98,11 +323,19 @@ fn build_parking_search(
     }
 
     let Ok(api_key) = env::var("GOOGLE_MAPS_API_KEY") else {
-        println!("parking search disabled: GOOGLE_MAPS_API_KEY is not configured");
+        info!(
+            service = "parking-api",
+            event = "search_disabled",
+            "Google key not configured"
+        );
         return Ok(None);
     };
     if api_key.trim().is_empty() {
-        println!("parking search disabled: GOOGLE_MAPS_API_KEY is empty");
+        info!(
+            service = "parking-api",
+            event = "search_disabled",
+            "Google key is empty"
+        );
         return Ok(None);
     }
 
@@ -151,11 +384,15 @@ async fn create_parking_spot(
     validate_coordinates(payload.latitude, payload.longitude)?;
 
     let id = ParkingSpotId::from_uuid(payload.id);
-    let result = state
-        .repository
-        .create_parking_spot(id, payload.latitude, payload.longitude)
-        .await
-        .map_err(|_| ApiError::internal())?;
+    let result = tokio::time::timeout(
+        state.database_operation_timeout,
+        state
+            .repository
+            .create_parking_spot(id, payload.latitude, payload.longitude),
+    )
+    .await
+    .map_err(|_| ApiError::internal())?
+    .map_err(|_| ApiError::internal())?;
     let status = match result {
         CreateParkingSpotResult::Created => StatusCode::CREATED,
         CreateParkingSpotResult::AlreadyExists => StatusCode::OK,
@@ -180,11 +417,13 @@ async fn create_observation(
         model_version: payload.model_version,
     };
 
-    let result = state
-        .repository
-        .store_observation(&observation)
-        .await
-        .map_err(map_repository_error)?;
+    let result = tokio::time::timeout(
+        state.database_operation_timeout,
+        state.repository.store_observation(&observation),
+    )
+    .await
+    .map_err(|_| ApiError::internal())?
+    .map_err(map_repository_error)?;
     let (status, outcome) = match result {
         StoreObservationResult::Stored => (StatusCode::ACCEPTED, "stored"),
         StoreObservationResult::Duplicate => (StatusCode::OK, "duplicate"),
@@ -207,26 +446,28 @@ async fn find_free_parking_spots(
         ));
     }
 
-    let spots = state
-        .repository
-        .find_free_parking_spots(
+    let spots = tokio::time::timeout(
+        state.database_operation_timeout,
+        state.repository.find_free_parking_spots(
             query.lat,
             query.lon,
             query.radius_m,
             Utc::now(),
             DEFAULT_OBSERVATION_TTL,
-        )
-        .await
-        .map_err(|_| ApiError::internal())?
-        .into_iter()
-        .map(|spot| FreeParkingSpotResponse {
-            id: spot.id.into_uuid(),
-            latitude: spot.latitude,
-            longitude: spot.longitude,
-            observed_at: spot.observed_at,
-            distance_m: spot.distance_m,
-        })
-        .collect();
+        ),
+    )
+    .await
+    .map_err(|_| ApiError::internal())?
+    .map_err(|_| ApiError::internal())?
+    .into_iter()
+    .map(|spot| FreeParkingSpotResponse {
+        id: spot.id.into_uuid(),
+        latitude: spot.latitude,
+        longitude: spot.longitude,
+        observed_at: spot.observed_at,
+        distance_m: spot.distance_m,
+    })
+    .collect();
 
     Ok(Json(FindFreeParkingSpotsResponse { spots }))
 }
@@ -244,10 +485,13 @@ async fn find_parking(
         ));
     }
     let search = state.parking_search.ok_or_else(ApiError::not_configured)?;
-    let outcome = search
-        .execute(origin, &payload.destination_address)
-        .await
-        .map_err(map_search_error)?;
+    let outcome = tokio::time::timeout(
+        state.search_timeout,
+        search.execute(origin, &payload.destination_address),
+    )
+    .await
+    .map_err(|_| ApiError::search_timeout())?
+    .map_err(map_search_error)?;
 
     match outcome {
         FindParkingOutcome::Found(result) => Ok((
@@ -538,6 +782,13 @@ impl ApiError {
         }
     }
 
+    const fn search_timeout() -> Self {
+        Self {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            message: "search_timeout",
+        }
+    }
+
     const fn internal() -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -561,4 +812,133 @@ impl IntoResponse for ApiError {
 #[derive(Serialize)]
 struct ErrorResponse {
     error: &'static str,
+}
+
+#[cfg(test)]
+mod operability_tests {
+    use super::*;
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
+    use tower::ServiceExt;
+
+    fn unavailable_app() -> Router {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(StdDuration::from_millis(100))
+            .connect_lazy("postgres://parking:parking@127.0.0.1:1/parking")
+            .expect("valid test database URL");
+        app(
+            AppState {
+                repository: ParkingRepository::new(pool),
+                parking_search: None,
+                database_check_timeout: StdDuration::from_millis(100),
+                database_operation_timeout: StdDuration::from_secs(5),
+                search_timeout: StdDuration::from_secs(15),
+            },
+            HeaderValue::from_static("http://localhost:5173"),
+        )
+    }
+
+    async fn get(router: Router, path: &str) -> Response {
+        router
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("valid test request"),
+            )
+            .await
+            .expect("router response")
+    }
+
+    #[tokio::test]
+    async fn liveness_does_not_depend_on_database() {
+        let response = get(unavailable_app(), "/health/live").await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn readiness_fails_when_database_is_unavailable() {
+        let response = get(unavailable_app(), "/health/ready").await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("response body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+        assert_eq!(json["checks"]["database"], "unavailable");
+    }
+
+    #[tokio::test]
+    async fn readiness_succeeds_with_local_postgres() {
+        let Ok(url) = env::var("DATABASE_URL") else {
+            return;
+        };
+        let repository = ParkingRepository::connect(&url)
+            .await
+            .expect("local PostgreSQL");
+        let response = get(
+            app(
+                AppState {
+                    repository,
+                    parking_search: None,
+                    database_check_timeout: StdDuration::from_millis(1500),
+                    database_operation_timeout: StdDuration::from_secs(5),
+                    search_timeout: StdDuration::from_secs(15),
+                },
+                HeaderValue::from_static("http://localhost:5173"),
+            ),
+            "/health/ready",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn version_endpoint_returns_service_and_version() {
+        let response = get(unavailable_app(), "/version").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("response body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+        assert_eq!(json["service"], "parking-api");
+        assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn response_contains_request_id() {
+        let response = get(unavailable_app(), "/health/live").await;
+        let id = response
+            .headers()
+            .get("x-request-id")
+            .expect("request ID")
+            .to_str()
+            .expect("ASCII request ID");
+        assert!(Uuid::parse_str(id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn valid_incoming_request_id_is_propagated() {
+        let id = Uuid::new_v4();
+        let response = unavailable_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/health/live")
+                    .header("x-request-id", id.to_string())
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router response");
+        assert_eq!(
+            response
+                .headers()
+                .get("x-request-id")
+                .expect("request ID")
+                .to_str()
+                .expect("ASCII"),
+            id.to_string()
+        );
+    }
 }

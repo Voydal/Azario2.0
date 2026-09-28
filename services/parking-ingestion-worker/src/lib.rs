@@ -12,6 +12,7 @@ use parking_events::{
     SpotObservationV1,
 };
 use parking_persistence::{ParkingRepository, RepositoryError, StoreObservationResult};
+use tracing::{info, warn};
 
 pub const CONSUMER_ACK_WAIT: Duration = Duration::from_secs(5);
 pub const CONSUMER_MAX_DELIVER: i64 = 5;
@@ -76,8 +77,8 @@ pub async fn process_payload(repository: &ParkingRepository, payload: &[u8]) -> 
         Err(RepositoryError::SequenceOutOfRange(_)) => {
             ProcessingResult::PermanentFailure("sequence does not fit PostgreSQL BIGINT".into())
         }
-        Err(RepositoryError::Database(error)) => {
-            ProcessingResult::RetryableFailure(format!("persistence failure: {error}"))
+        Err(RepositoryError::Database(_)) => {
+            ProcessingResult::RetryableFailure("persistence failure".into())
         }
     }
 }
@@ -91,18 +92,36 @@ pub async fn handle_message(
     match &result {
         ProcessingResult::Processed => {
             message.ack().await?;
-            println!("event processed and ACKed");
+            info!(
+                service = "parking-ingestion-worker",
+                event = "message_acked",
+                "event processed"
+            );
         }
         ProcessingResult::Duplicate => {
             message.ack().await?;
-            println!("duplicate event ACKed");
+            info!(
+                service = "parking-ingestion-worker",
+                event = "duplicate_acked",
+                "duplicate event"
+            );
         }
         ProcessingResult::RetryableFailure(reason) => {
-            eprintln!("event NAK: {reason}");
+            warn!(
+                service = "parking-ingestion-worker",
+                event = "message_nak",
+                reason,
+                "event NAK"
+            );
             message.ack_with(AckKind::Nak(Some(RETRY_DELAY))).await?;
         }
         ProcessingResult::PermanentFailure(reason) => {
-            eprintln!("invalid event TERM: {reason}");
+            warn!(
+                service = "parking-ingestion-worker",
+                event = "message_term",
+                reason,
+                "invalid event TERM"
+            );
             message.ack_with(AckKind::Term).await?;
         }
     }
