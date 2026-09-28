@@ -1,0 +1,13 @@
+schema_version = 1
+dataset_name = "synthetic-perception-eval"
+version = "1.0.0"
+description = "Small synthetic fixture for evaluator tests; not real parking data."
+model_name = "synthetic-detections"
+model_version = "fixture-v1"
+
+[[videos]]
+video_id = "synthetic-01"
+camera_id = "11111111-1111-1111-1111-111111111111"
+detections_path = "detections.jsonl"
+ground_truth_path = "ground_truth.jsonl"
+roi_config_path = "edge-camera.toml"

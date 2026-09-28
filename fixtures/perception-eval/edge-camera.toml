@@ -1,0 +1,31 @@
+camera_id = "11111111-1111-1111-1111-111111111111"
+video_file = "unused.mp4"
+sample_interval_ms = 500
+observation_refresh_interval_ms = 5000
+stable_samples_required = 3
+model_path = "unused.onnx"
+model_version = "fixture-v1"
+input_width = 640
+input_height = 640
+vehicle_class_ids = [2]
+detection_confidence_threshold = 0.5
+free_threshold = 0.1
+occupied_threshold = 0.3
+
+[[spots]]
+spot_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+polygon = [
+  { x = 0.1, y = 0.1 },
+  { x = 0.4, y = 0.1 },
+  { x = 0.4, y = 0.4 },
+  { x = 0.1, y = 0.4 },
+]
+
+[[spots]]
+spot_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+polygon = [
+  { x = 0.6, y = 0.1 },
+  { x = 0.9, y = 0.1 },
+  { x = 0.9, y = 0.4 },
+  { x = 0.6, y = 0.4 },
+]

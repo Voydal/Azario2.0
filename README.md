@@ -440,3 +440,155 @@ npm run build
 Jedno miejsce parkingowe ma jedno autorytatywne źródło obserwacji w danym czasie. System nie
 implementuje sensor fusion ani rozbudowanego ownership kamer. `sequence` ustala kolejność
 zdarzeń, a `observed_at` służy wyłącznie do oceny świeżości obserwacji.
+
+## Perception evaluation
+
+Etap 7.1 używa osobnego `perception-evaluator`: czyta wcześniej zapisane detekcje i niezależny
+ground truth, a scoring ROI i stabilizację wykonuje przez ten sam crate `parking-perception` co
+edge. Nie uruchamia ONNX ani nie zmienia konfiguracji produkcyjnej. Najpierw wygeneruj
+`detections.jsonl` raz przy ustalonej częstości próbkowania, przygotuj niezależne
+`ground_truth.jsonl`, a następnie uruchamiaj wiele porównań progów na tych samych danych.
+Generowanie dumpu detekcji z wideo opisuje sekcja „Real-data evaluation workflow” poniżej.
+
+Manifest `dataset.toml` ma `schema_version = 1`, nazwę, wersję, opis i listę `[[videos]]`
+z `video_id`, `camera_id`, `detections_path`, `ground_truth_path` i
+`roi_config_path`. Ścieżki są względne wobec manifestu. ROI wskazuje zwykłą konfigurację
+edge (te same `[[spots]]`, `polygon`, `vehicle_class_ids` i refresh interval).
+Każdy wiersz JSONL ma `schema_version: 1`. Detekcja zawiera `video_id`, `camera_id`,
+`frame_index`, `timestamp_ms` i listę detekcji z `class_id`, `confidence` oraz
+znormalizowanym bbox (`x_min`, `y_min`, `x_max`, `y_max`). Ground truth zawiera
+`video_id`, `spot_id`, `timestamp_ms` i `state`: `free`, `occupied` lub `unknown`.
+Mały syntetyczny przykład jest w `fixtures/perception-eval/`; nie jest reprezentatywnym
+zbiorem parkingowym. Dużych filmów, klatek i dumpów nie commitujemy
+(`datasets/raw/`, `datasets/generated/`, `evaluation-output/` są ignorowane).
+
+```bash
+cargo run -p perception-evaluator -- evaluate \
+  --dataset fixtures/perception-eval/dataset.toml \
+  --output evaluation-output/fixture-evaluate \
+  --confidence 0.5 --free 0.1 --occupied 0.3 --stable-samples 3
+
+cargo run -p perception-evaluator -- sweep \
+  --dataset fixtures/perception-eval/dataset.toml \
+  --output evaluation-output/fixture-sweep \
+  --confidence-values 0.4,0.5,0.6 \
+  --free-values 0.05,0.10,0.15 \
+  --occupied-values 0.25,0.30,0.35 \
+  --stable-samples-values 2,3,4
+```
+
+Dostępne są `--ground-truth-tolerance-ms` (domyślnie 250) i
+`--transition-timeout-ms` (domyślnie 10000). Etykieta jest dopasowana po
+`video_id + spot_id + najbliższy timestamp`; remis rozstrzyga wcześniejsza adnotacja.
+Nieoznaczone próbki i `unknown` są raportowane, ale wyłączone z klasyfikacji.
+`Unknown` przerywa ciąg znanych etykiet przy wykrywaniu transitions — zmiana przez lukę
+unknown nie ma przypisanej dokładnej latencji. Pierwsze próbki bez ustalonego stanu stabilnego
+są oceniane jako prediction `UNCERTAIN`.
+
+`results.csv` ma jeden wiersz na poprawną konfigurację z oddzielnymi kolumnami `frame_*`
+i metrykami stanu stabilnego. `per_camera.csv` ma przekrój dla każdej kamery. `summary.json` zawiera
+wersję schematu, balans klas, metryki frame/stabilized dla pojedynczej ewaluacji lub wybranej
+konfiguracji, metryki per-camera, SHA-256 wejść i liczbę pominiętych kombinacji.
+`evaluation-config.json` zapisuje wszystkie parametry. Dla pełnej powtarzalności
+`evaluation_timestamp` jest domyślnie `null`; można podać jawny znacznik RFC3339 przez
+`--evaluation-timestamp 2026-01-01T00:00:00Z`.
+
+Analizuj przede wszystkim false-free (zajęte miejsce błędnie pokazane jako wolne), coverage,
+F1 obu klas oraz latencję zmian. `UNCERTAIN` zmniejsza coverage, ale szerszy obszar
+niepewności może ograniczyć kosztowne błędne decyzje. Strict accuracy jest pomocnicza i
+może mylić przy niezbalansowanych klasach. Bez limitów narzędzie nie wskazuje zwycięzcy;
+`--max-false-free-rate` i/lub `--min-coverage` włączają jawny wybór najwyższego macro F1
+spośród konfiguracji spełniających ograniczenia. Limitów nie narzucamy z góry.
+
+Wynik sweep dotyczy tylko użytego datasetu i cadence detekcji, nie jest globalnie
+najlepszym zestawem progów. Strojenie i końcowy raport na tych samych danych zawyżają ocenę:
+docelowo należy mieć oddzielny zbiór kalibracyjny/walidacyjny oraz held-out test.
+
+## Real-data evaluation workflow
+
+Etap 7.2A łączy istniejące elementy:
+
+```text
+recorded video -> GStreamer -> frame sampling -> existing OnnxDetector
+               -> raw Detection[] -> detections.jsonl -> perception-evaluator
+```
+
+1. Przygotuj model zgodny **dokładnie** z kontraktem `ParkingDetectorV1` opisanym wyżej
+   (wejście float32 `[1,3,H,W]`, RGB/CHW/stretch, output float32 `[N,6]` po NMS).
+   Nie wystarczy dowolny eksport YOLO ONNX.
+2. Przygotuj lokalny plik nagrania. Model i film mogą znajdować się poza repozytorium;
+   do uruchomienia potrzebna jest także lokalna biblioteka CPU ONNX Runtime wskazana przez
+   `ORT_DYLIB_PATH`.
+3. Wygeneruj detekcje jednokrotnie:
+
+```bash
+export ORT_DYLIB_PATH=/path/to/libonnxruntime.so
+cargo run -p perception-evaluator -- generate-detections \
+  --video /path/to/recording.mp4 \
+  --model /path/to/parking-detector-v1.onnx \
+  --camera-id 11111111-1111-1111-1111-111111111111 \
+  --video-id real-run-001 \
+  --sample-interval-ms 500 \
+  --input-width 640 --input-height 640 \
+  --output datasets/real-run-001/detections.jsonl
+```
+
+Można zamiast ścieżek i parametrów użyć `--config config/edge-camera.toml` z istniejącym
+formatem edge; `--video-id` i `--output` nadal są wymagane. Precedence:
+jawne argumenty CLI > `PARKING_MODEL_PATH`/`PARKING_VIDEO_PATH` > edge config;
+bez configu domyślny sampling to 500 ms i rozmiar wejścia 640×640.
+`--detector-output-floor` ma domyślnie 0.0 i nie jest produkcyjnym
+`detection_confidence_threshold`. Generator nie filtruje `vehicle_class_ids`:
+zachowuje wszystkie klasy i niskie confidence, żeby późniejszy sweep nie wymagał ponownej
+inferencji. `--force` jawnie zezwala na zastąpienie istniejącego outputu; domyślnie
+nadpisanie jest zabronione.
+
+4. Przygotuj niezależne, ręcznie lub zewnętrznie oznaczone `ground_truth.jsonl` na poziomie
+   spot + timestamp. Generator nie tworzy ground truth.
+5. Utwórz/zaktualizuj `dataset.toml` w formacie Etapu 7.1, wskazując wygenerowany JSONL,
+   ground truth i tę samą konfigurację ROI.
+6. Uruchom `evaluate`, następnie osobno `sweep` z przykładu powyżej.
+7. Analizuj false-free, coverage, F1 obu klas i latencję zmian; nie wybieraj progów na
+   podstawie samego accuracy.
+
+Sugerowany układ:
+
+```text
+datasets/real-run-001/
+├── dataset.toml
+├── detections.jsonl
+├── detections-metadata.json
+└── ground_truth.jsonl
+```
+
+Każdy rekord JSONL ma `schema_version: 1`; `frame_index` oznacza kolejny **zapisany
+sample** od 0, nie indeks klatki źródłowej. `timestamp_ms` pochodzi z GStreamer PTS
+(czas prezentacji wideo), nie z zegara systemowego. Brak PTS lub cofnięcie PTS jest
+błędem — nie ma fallbacku do wall clock. Ten sam film i sample interval dają te same
+rekordy przy deterministycznym modelu. `detections-metadata.json` zapisuje nazwę
+i SHA-256 modelu oraz wideo, kontrakt, rozmiar wejścia, cadence, output floor,
+czas uruchomienia i liczbę rekordów. Pole `generated_at` oraz czas wykonania są
+naturalnie różne między uruchomieniami; sam `detections.jsonl` jest artefaktem
+do porównywania i ponownej ewaluacji.
+
+Zapis jest strumieniowy do `detections.jsonl.tmp`. Dopiero poprawny EOF, flush,
+zapis metadata i rename publikują finalny plik. Brak modelu/wideo/ORT, niezgodny
+kontrakt modelu, błąd inferencji, nieprawidłowy output modelu lub błąd zapisu
+kończą generowanie błędem bez udawania kompletnego datasetu. Polityka badawcza
+jest tu **fail-fast**, inaczej niż runtime edge, który może pominąć błędną klatkę.
+Generator nie łączy się z NATS ani PostgreSQL, nie używa SQLite sequence i nie
+publikuje `SpotObservationV1`; nie uruchamia też `evaluate` automatycznie.
+
+`detections.jsonl` opisuje obecność i położenie obiektów, ale nie zawiera surowych
+klatek, cropów, twarzy ani tablic. Artefakty nie są automatycznie przesyłane do
+chmury; duże dane i modele pozostają poza Git. Testy fake source/fake detector
+oraz syntetyczny GStreamer pozwalają sprawdzić pipeline bez realnego modelu
+i nagrania. Etap 7.2A przygotowuje real-data pipeline, lecz nie potwierdza jeszcze
+jakości ani poprawności konkretnego modelu na rzeczywistym nagraniu.
+
+Test syntetycznej ścieżki GStreamer → fake detector → JSONL (wymaga bibliotek i pluginów
+GStreamer, domyślnie ignorowany):
+
+```bash
+cargo test -p perception-evaluator gstreamer_synthetic_source_generates_jsonl -- --ignored
+```

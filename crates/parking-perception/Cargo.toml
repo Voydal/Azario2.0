@@ -7,4 +7,6 @@ license.workspace = true
 [dependencies]
 chrono = { workspace = true }
 geo = { workspace = true }
+serde = { workspace = true }
+uuid = { workspace = true }
 parking-domain = { path = "../parking-domain" }

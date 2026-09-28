@@ -76,8 +76,8 @@ impl GstreamerFileSource {
         })
     }
 
-    #[cfg(test)]
-    fn test_pattern(width: u32, height: u32) -> Result<Self, FrameSourceError> {
+    /// Synthetic source for offline pipeline validation; requires videotestsrc.
+    pub fn test_pattern(width: u32, height: u32) -> Result<Self, FrameSourceError> {
         gst::init().map_err(FrameSourceError::from_error)?;
         let pipeline = gst::Pipeline::new();
         let source = gst::ElementFactory::make("videotestsrc")
@@ -132,7 +132,9 @@ impl GstreamerFileSource {
             })?;
             pixels.extend_from_slice(bytes);
         }
-        Ok(Frame::rgb(info.width(), info.height(), pixels, Utc::now()))
+        let mut frame = Frame::rgb(info.width(), info.height(), pixels, Utc::now());
+        frame.video_timestamp_ms = buffer.pts().map(|pts| pts.mseconds());
+        Ok(frame)
     }
 }
 
@@ -232,6 +234,7 @@ mod tests {
         let frame = source.next_frame().unwrap().unwrap();
         assert_eq!((frame.width, frame.height), (64, 48));
         assert_eq!(frame.pixels.len(), 64 * 48 * 3);
+        assert!(frame.video_timestamp_ms.is_some());
         assert!(source.next_frame().unwrap().is_none());
     }
 }

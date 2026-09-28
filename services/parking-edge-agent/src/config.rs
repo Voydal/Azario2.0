@@ -8,8 +8,8 @@ use std::{
 };
 
 use chrono::Duration;
-use parking_domain::{CameraId, ParkingSpotId};
-use parking_perception::{NormalizedPoint, OccupancyConfig, ParkingSpotRoi, SpotStabilizer};
+use parking_domain::CameraId;
+use parking_perception::{OccupancyConfig, SpotConfig, SpotStabilizer};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -35,17 +35,7 @@ pub struct EdgeConfig {
     pub spots: Vec<SpotConfig>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
-pub struct SpotConfig {
-    pub spot_id: Uuid,
-    pub polygon: Vec<PointConfig>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize)]
-pub struct PointConfig {
-    pub x: f64,
-    pub y: f64,
-}
+pub use parking_perception::PointConfig;
 
 fn default_state_database() -> PathBuf {
     PathBuf::from("edge-state.db")
@@ -155,17 +145,6 @@ impl EdgeConfig {
             self.stable_samples_required,
             Duration::milliseconds(self.observation_refresh_interval_ms as i64),
         )
-    }
-}
-
-impl SpotConfig {
-    pub fn roi(&self) -> Result<ParkingSpotRoi, parking_perception::GeometryError> {
-        let points = self
-            .polygon
-            .iter()
-            .map(|point| NormalizedPoint::new(point.x, point.y))
-            .collect::<Result<Vec<_>, _>>()?;
-        ParkingSpotRoi::new(ParkingSpotId::from_uuid(self.spot_id), points)
     }
 }
 

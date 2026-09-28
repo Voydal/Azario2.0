@@ -12,7 +12,12 @@
 /web/*.tsbuildinfo
 *.onnx
 *.mp4
+*.mkv
 edge-state.db
 edge-state.db-*
 /artifacts/
+/datasets/raw/
+/datasets/generated/
+/datasets/real-*/
+/evaluation-output/
 /config/edge-camera.toml

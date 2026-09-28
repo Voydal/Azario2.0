@@ -119,6 +119,7 @@ fn fake_perception(spot_id: ParkingSpotId) -> PendingObservation {
         height: 2,
         pixels: Arc::from([0_u8; 12]),
         captured_at: Utc::now(),
+        video_timestamp_ms: None,
     };
     let mut source = FakeFrameSource(Some(frame));
     let frame = source.next_frame().unwrap().unwrap();

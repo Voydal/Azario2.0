@@ -1,5 +1,6 @@
 use std::{collections::HashMap, time::Duration};
 
+use crate::sampling::FrameSampler;
 use chrono::{DateTime, Utc};
 use parking_domain::{ObservedState, ParkingSpotId};
 use parking_perception::{
@@ -19,8 +20,7 @@ pub struct PerceptionPipeline {
     occupancy: OccupancyEngine,
     spots: Vec<ParkingSpotRoi>,
     stabilizers: HashMap<ParkingSpotId, SpotStabilizer>,
-    sample_interval: Duration,
-    last_sampled_at: Option<DateTime<Utc>>,
+    sampler: FrameSampler,
 }
 
 impl PerceptionPipeline {
@@ -39,23 +39,13 @@ impl PerceptionPipeline {
             occupancy,
             spots,
             stabilizers,
-            sample_interval,
-            last_sampled_at: None,
+            sampler: FrameSampler::new(sample_interval),
         }
     }
 
     #[must_use]
     pub fn should_sample(&mut self, captured_at: DateTime<Utc>) -> bool {
-        if self.last_sampled_at.is_some_and(|last| {
-            captured_at
-                .signed_duration_since(last)
-                .to_std()
-                .is_ok_and(|elapsed| elapsed < self.sample_interval)
-        }) {
-            return false;
-        }
-        self.last_sampled_at = Some(captured_at);
-        true
+        self.sampler.should_sample(captured_at)
     }
 
     pub fn process_detections(

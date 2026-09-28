@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ort::{
     session::Session,
@@ -19,6 +19,24 @@ impl OnnxDetector {
                 "model input dimensions must be positive",
             ));
         }
+        let dylib_path = std::env::var_os("ORT_DYLIB_PATH")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                format!(
+                    "{}onnxruntime{}",
+                    std::env::consts::DLL_PREFIX,
+                    std::env::consts::DLL_SUFFIX
+                )
+                .into()
+            });
+        let _ = ort::init_from(&dylib_path)
+            .map_err(|error| {
+                DetectionError::new(format!(
+                    "cannot load ONNX Runtime dynamic library; set ORT_DYLIB_PATH: {error}"
+                ))
+            })?
+            .commit();
         let session = Session::builder()
             .and_then(|mut builder| builder.commit_from_file(path))
             .map_err(|error| DetectionError::new(format!("cannot load ONNX model: {error}")))?;
@@ -164,6 +182,7 @@ mod tests {
             height: 1,
             pixels: Arc::from([255_u8, 0, 0, 0, 128, 255]),
             captured_at: Utc::now(),
+            video_timestamp_ms: None,
         };
         let output = preprocess_stretch_rgb_chw(&frame, 2, 1).unwrap();
         assert_eq!(output, vec![1.0, 0.0, 0.0, 128.0 / 255.0, 0.0, 1.0]);

@@ -10,6 +10,8 @@ pub struct Frame {
     pub height: u32,
     pub pixels: Arc<[u8]>,
     pub captured_at: DateTime<Utc>,
+    /// Presentation timestamp from a recorded source, in milliseconds.
+    pub video_timestamp_ms: Option<u64>,
 }
 
 impl Frame {
@@ -20,6 +22,7 @@ impl Frame {
             height,
             pixels: pixels.into(),
             captured_at,
+            video_timestamp_ms: None,
         }
     }
 }
