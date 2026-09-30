@@ -1,0 +1,6 @@
+target/
+.git/
+web/node_modules/
+web/dist/
+.env
+.env.*
