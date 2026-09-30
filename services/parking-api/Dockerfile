@@ -16,7 +16,14 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd --system --uid 10001 appuser
+RUN groupadd --system --gid 10001 appgroup \
+    && useradd \
+        --system \
+        --uid 10001 \
+        --gid appgroup \
+        --no-create-home \
+        --shell /usr/sbin/nologin \
+        appuser
 
 COPY --from=builder /usr/local/bin/parking-api /usr/local/bin/parking-api
 
