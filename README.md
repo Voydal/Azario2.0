@@ -45,6 +45,23 @@ Camera / simulator / recorded video
 
 The simulator publishes observations without processing images. The edge agent processes local recordings; raw video is not sent to the cloud by default. Google Routes is an optional dependency of the search path, not of the health checks.
 
+## ADR-001: Frontend deployment strategy
+
+Decision:
+Use a containerized static frontend for local production-like
+development and Compose.
+
+For the target cloud architecture, deploy the built SPA using
+static hosting/CDN rather than running frontend pods in Kubernetes.
+
+Rationale:
+- frontend is a static React/Vite SPA
+- containerization is useful for local integration and learning
+- Kubernetes compute is unnecessary for serving static assets
+- CDN/static hosting better matches the production workload
+- deployment strategy can be revisited if SSR or other server-side
+  requirements appear
+
 ## Engineering Principles
 
 - A stale FREE observation becomes UNKNOWN; a failure is never interpreted as FREE.
