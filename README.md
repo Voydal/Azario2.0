@@ -1,6 +1,6 @@
-# parking-platform
+# Azario - parking spot guide
 
-I am developing parking-platform as a research and learning project: a distributed Rust system for estimating parking-space availability, with video processing at the edge. The application is designed with production concerns in mind, but it is **not production-ready**.
+I am developing parking-platform as a research and learning project: a distributed Rust system for estimating parking-space availability, with video processing at the edge and frontend where app provides you map with trace to the destination. The application is designed with production concerns in mind, but it is **not production-ready**.
 
 ## Project Background
 
