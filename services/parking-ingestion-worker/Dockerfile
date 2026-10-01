@@ -27,5 +27,4 @@ COPY --from=builder /usr/local/bin/parking-ingestion-worker /usr/local/bin/parki
 
 USER appuser
 
-
 ENTRYPOINT ["/usr/local/bin/parking-ingestion-worker"]
