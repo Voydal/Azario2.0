@@ -1,3 +1,9 @@
+x-api-image: &api-image
+  image: azario-parking-api:local
+  build:
+    context: .
+    dockerfile: services/parking-api/Dockerfile
+
 services:
   postgres:
     image: postgis/postgis:17-3.5
@@ -6,7 +12,8 @@ services:
       POSTGRES_USER: parking
       POSTGRES_PASSWORD: parking
     ports:
-      - "5432:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    networks: [data]
     volumes:
       - parking-postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -21,8 +28,9 @@ services:
     image: nats:2.15.0-alpine
     command: ["--jetstream", "--store_dir", "/data", "--http_port", "8222"]
     ports:
-      - "4222:4222"
-      - "8222:8222"
+      - "127.0.0.1:${NATS_PORT:-4222}:4222"
+      - "127.0.0.1:${NATS_MONITOR_PORT:-8222}:8222"
+    networks: [events]
     volumes:
       - parking-nats-data:/data
     healthcheck:
@@ -33,6 +41,146 @@ services:
       start_period: 5s
     restart: unless-stopped
 
+  migrate:
+    <<: *api-image
+    command: ["migrate"]
+    environment:
+      DATABASE_URL: postgres://parking:parking@postgres:5432/parking
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      RUST_LOG: ${RUST_LOG:-info}
+    networks: [data]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *api-image
+    environment:
+      DATABASE_URL: postgres://parking:parking@postgres:5432/parking
+      API_BIND_ADDRESS: 0.0.0.0:3000
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:8080}
+      GOOGLE_MAPS_API_KEY: ${GOOGLE_MAPS_API_KEY:-}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "127.0.0.1:${API_PORT:-3000}:3000"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks: [frontend, data]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    stop_grace_period: 15s
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: services/parking-ingestion-worker/Dockerfile
+    environment:
+      DATABASE_URL: postgres://parking:parking@postgres:5432/parking
+      NATS_URL: nats://nats:4222
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      RUST_LOG: ${RUST_LOG:-info}
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks: [data, events]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      nats:
+        condition: service_healthy
+    stop_grace_period: 15s
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+      args:
+        VITE_PARKING_API_BASE_URL: ${VITE_PARKING_API_BASE_URL:-http://localhost:3000}
+        VITE_GOOGLE_MAPS_API_KEY: ${VITE_GOOGLE_MAPS_API_KEY:-}
+        VITE_GOOGLE_MAP_ID: ${VITE_GOOGLE_MAP_ID:-DEMO_MAP_ID}
+    ports:
+      - "127.0.0.1:${WEB_PORT:-8080}:8080"
+    networks: [frontend]
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:8080/index.html"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  edge:
+    profiles: ["edge"]
+    build:
+      context: .
+      dockerfile: services/parking-edge-agent/Dockerfile
+    environment:
+      NATS_URL: nats://nats:4222
+      PARKING_MODEL_PATH: /artifacts/parking-detector-v1.onnx
+      PARKING_VIDEO_PATH: /artifacts/parking-camera.mp4
+      ORT_DYLIB_PATH: /onnxruntime/libonnxruntime.so
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      RUST_LOG: ${RUST_LOG:-info}
+    networks: [events]
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    volumes:
+      - type: bind
+        source: ./config/edge-camera.toml
+        target: /etc/parking-edge/camera.toml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${EDGE_ARTIFACTS_DIR:-./artifacts}
+        target: /artifacts
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${EDGE_ONNX_RUNTIME_DIR:-./artifacts/onnxruntime}
+        target: /onnxruntime
+        read_only: true
+        bind:
+          create_host_path: false
+      - parking-edge-data:/var/lib/parking-edge
+    depends_on:
+      nats:
+        condition: service_healthy
+    stop_grace_period: 20s
+    restart: "no"
+
+networks:
+  frontend:
+  data:
+    internal: true
+  events:
+    internal: true
+  # Allows host-run camera-simulator to reach the loopback-published NATS port.
+  nats-access:
+
 volumes:
   parking-nats-data:
   parking-postgres-data:
+  parking-edge-data:

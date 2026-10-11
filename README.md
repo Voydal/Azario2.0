@@ -150,6 +150,83 @@ The `PARKING_OBSERVATIONS` stream stores `parking.observations.v1` on disk using
 
 Delivery is at least once. The worker ACKs only after the PostgreSQL commit. A transient database failure causes NAK and redelivery; malformed JSON or an unsupported contract version causes TERM. Redelivery after a commit is safe because of the `event_id` primary key, the unique `(camera_id, spot_id, sequence)` constraint, and a conditional UPSERT.
 
+## Running the Camera Simulator with Compose
+
+Run `camera-simulator` on the host with Rust/Cargo, from the repository root.
+It publishes occupancy metadata without a camera, video, or ONNX model. The
+Compose API and worker must be running; the worker provisions the JetStream
+stream and persists the observations.
+
+### Temporarily expose NATS to the host
+
+The `events` network uses `internal: true`. With NATS attached only to that
+network, its published port is unavailable from the host and the simulator
+receives `Connection refused`. For the duration of host simulator testing,
+add `nats-access` to **the NATS service's** `networks` list in `compose.yaml`:
+
+```yaml
+services:
+  nats:
+    # Keep the existing image, command, volumes, healthcheck, and ports.
+    ports:
+      - "127.0.0.1:${NATS_PORT:-4222}:4222"
+      - "127.0.0.1:${NATS_MONITOR_PORT:-8222}:8222"
+    networks: [events, nats-access]
+
+networks:
+  events:
+    internal: true
+  nats-access: {}  # Must not have internal: true.
+```
+
+This is an excerpt: preserve the other services and networks. The top-level
+`nats-access` definition is already present in this repository; attaching NATS
+to it is the step needed to enable host access. Keep the loopback port bindings.
+Apply the change by recreating NATS; a plain `docker compose restart` does not
+apply changes to networks or port mappings:
+
+```bash
+docker compose up -d --no-deps --force-recreate nats
+docker compose up -d --build api worker
+docker compose ps
+docker compose port nats 4222
+curl -f http://127.0.0.1:8222/healthz
+```
+
+With the default ports, the port command should report `127.0.0.1:4222`.
+If you override `NATS_PORT` or `NATS_MONITOR_PORT`, use those host ports in
+`NATS_URL` and the health check command respectively.
+
+### Publish and verify an observation
+
+Create the parking spot using the API command in the manual smoke test below
+(once per spot). Then run:
+
+```bash
+export NATS_URL=nats://127.0.0.1:4222
+cargo run -p camera-simulator -- \
+  --spot-id 019c1234-1234-7000-8000-123456789abe \
+  --camera-id 019c1234-1234-7000-8000-123456789abd \
+  --sequence 101 \
+  --state free
+
+curl -i 'http://127.0.0.1:3000/v1/parking-spots/free?lat=52.2297&lon=21.0122&radius_m=500'
+```
+
+Each invocation publishes **one observation** and exits after the JetStream
+acknowledgement. Accepted states are `free`, `occupied`, and `uncertain`.
+Increase `--sequence` for each subsequent observation for the same camera/spot;
+if you already used 101, choose a number higher than the last one. Query shortly
+after publishing: after the 15-second TTL, the state becomes `UNKNOWN`.
+If the stream is missing, check `docker compose logs worker` and wait for the
+worker to provision it before retrying. A JetStream acknowledgement confirms
+publication; allow the worker a moment to persist the event before querying.
+
+When host simulator testing is finished, restore the NATS service to
+`networks: [events]` and run
+`docker compose up -d --no-deps --force-recreate nats` again. Containerized
+producers continue to use `nats://nats:4222` on the internal `events` network.
+
 ## Manual Smoke Test
 
 Create a parking spot:
@@ -164,7 +241,9 @@ curl -i -X POST http://127.0.0.1:3000/v1/parking-spots \
   }'
 ```
 
-In a second terminal, start the worker:
+If the worker is already running in Compose, skip this step. For a worker
+running directly on the host, start it in a second terminal (host access to
+PostgreSQL must also be enabled):
 
 ```bash
 export DATABASE_URL=postgres://parking:parking@localhost:5432/parking
@@ -172,7 +251,8 @@ export NATS_URL=nats://127.0.0.1:4222
 cargo run -p parking-ingestion-worker
 ```
 
-In a third terminal, publish a FREE observation:
+In another terminal, publish a FREE observation. For Compose, first enable
+host access to NATS as described above:
 
 ```bash
 export NATS_URL=nats://127.0.0.1:4222
