@@ -4,20 +4,25 @@ x-api-image: &api-image
     context: .
     dockerfile: services/parking-api/Dockerfile
 
+x-database-environment: &database-environment
+  DATABASE_URL: postgres://${POSTGRES_USER:-parking}:${POSTGRES_PASSWORD:-parking}@postgres:5432/${POSTGRES_DB:-parking}
+  DATABASE_MAX_CONNECTIONS: ${DATABASE_MAX_CONNECTIONS:-10}
+  DATABASE_ACQUIRE_TIMEOUT_MS: ${DATABASE_ACQUIRE_TIMEOUT_MS:-2000}
+
 services:
   postgres:
     image: postgis/postgis:17-3.5
     environment:
-      POSTGRES_DB: parking
-      POSTGRES_USER: parking
-      POSTGRES_PASSWORD: parking
+      POSTGRES_DB: ${POSTGRES_DB:-parking}
+      POSTGRES_USER: ${POSTGRES_USER:-parking}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-parking}
     ports:
       - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     networks: [data]
     volumes:
       - parking-postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U parking -d parking"]
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -45,7 +50,7 @@ services:
     <<: *api-image
     command: ["migrate"]
     environment:
-      DATABASE_URL: postgres://parking:parking@postgres:5432/parking
+      <<: *database-environment
       LOG_FORMAT: ${LOG_FORMAT:-json}
       RUST_LOG: ${RUST_LOG:-info}
     networks: [data]
@@ -57,7 +62,13 @@ services:
   api:
     <<: *api-image
     environment:
-      DATABASE_URL: postgres://parking:parking@postgres:5432/parking
+      <<: *database-environment
+      DATABASE_CHECK_TIMEOUT_MS: ${DATABASE_CHECK_TIMEOUT_MS:-1500}
+      DATABASE_OPERATION_TIMEOUT_MS: ${DATABASE_OPERATION_TIMEOUT_MS:-5000}
+      PARKING_SEARCH_TIMEOUT_MS: ${PARKING_SEARCH_TIMEOUT_MS:-15000}
+      GOOGLE_MAPS_HTTP_TIMEOUT_MS: ${GOOGLE_MAPS_HTTP_TIMEOUT_MS:-3000}
+      PARKING_SEARCH_RADIUS_M: ${PARKING_SEARCH_RADIUS_M:-800}
+      PARKING_CANDIDATE_LIMIT: ${PARKING_CANDIDATE_LIMIT:-25}
       API_BIND_ADDRESS: 0.0.0.0:3000
       FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:8080}
       GOOGLE_MAPS_API_KEY: ${GOOGLE_MAPS_API_KEY:-}
@@ -82,7 +93,7 @@ services:
       context: .
       dockerfile: services/parking-ingestion-worker/Dockerfile
     environment:
-      DATABASE_URL: postgres://parking:parking@postgres:5432/parking
+      <<: *database-environment
       NATS_URL: nats://nats:4222
       LOG_FORMAT: ${LOG_FORMAT:-json}
       RUST_LOG: ${RUST_LOG:-info}
