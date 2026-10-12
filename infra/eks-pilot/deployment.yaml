@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: parking-api
+  namespace: parking-pilot
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: parking-api
+  template:
+    metadata:
+      labels:
+        app: parking-api
+    spec:
+      terminationGracePeriodSeconds: 15
+      containers:
+        - name: parking-api
+          image: 165337436553.dkr.ecr.us-east-1.amazonaws.com/jsp/azario:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: parking-database
+                  key: DATABASE_URL
+            - name: API_BIND_ADDRESS
+              value: "0.0.0.0:3000"
+            - name: FRONTEND_ORIGIN
+              # Ustaw rzeczywisty adres frontendu.
+              value: "http://localhost"
+            - name: LOG_FORMAT
+              value: "json"
+            - name: RUST_LOG
+              value: "info"
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi

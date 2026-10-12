@@ -1,0 +1,106 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  # Separate class from the former Auto Mode provisioner.
+  name: parking-ebs-standard
+provisioner: ebs.csi.aws.com
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Retain
+allowVolumeExpansion: true
+parameters:
+  type: gp3
+  encrypted: "true"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: parking-pilot
+spec:
+  clusterIP: None
+  selector:
+    app: parking-postgis
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: parking-postgis
+  namespace: parking-pilot
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: parking-postgis
+  template:
+    metadata:
+      labels:
+        app: parking-postgis
+    spec:
+      terminationGracePeriodSeconds: 60
+      nodeSelector:
+        kubernetes.io/arch: amd64
+        kubernetes.io/os: linux
+      containers:
+        - name: postgres
+          image: postgis/postgis:17-3.5
+          # Initial tuning for a small pilot; revisit after measuring usage.
+          args:
+            - postgres
+            - -c
+            - shared_buffers=64MB
+            - -c
+            - max_connections=50
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: parking
+            - name: POSTGRES_USER
+              value: parking
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: parking-database
+                  key: POSTGRES_PASSWORD
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          startupProbe:
+            tcpSocket:
+              port: postgres
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - 'pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: parking-ebs-standard
+        resources:
+          requests:
+            storage: 20Gi
