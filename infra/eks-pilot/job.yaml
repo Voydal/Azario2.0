@@ -1,0 +1,53 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: parking-migrate
+  namespace: parking-pilot
+spec:
+  completions: 1
+  parallelism: 1
+  backoffLimit: 0
+  activeDeadlineSeconds: 300
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: parking-migrate
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      containers:
+        - name: migrate
+          image: #obraz
+          args: ["migrate"]
+          env:
+            - name: DATABASE_URL
+              valueForm:
+                secretKeyRef:
+                  name: parking-database
+                  key: DATABASE_URL
+            - name: DATABASE_MAX_CONNECTIONS
+              value: "2"
+            - name: DATABASE_ACQUIRE_TIMEOUT_MS
+              value: "5000"
+            - name: LOG_FORMAT
+              value: "json"
+            - name: RUST_LOG
+              value: "info"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        capabilites:
+          drop:
+            - ALL
+        seccompProfile:
+          type: RuntimeDefault
