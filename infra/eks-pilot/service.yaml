@@ -9,7 +9,7 @@ spec:
   type: ClusterIP
 
   selector:
-    app: parking-app
+    app: parking-api
 
   ports:
     - name: http
