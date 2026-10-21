@@ -1,17 +1,3 @@
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  # Separate class from the former Auto Mode provisioner.
-  name: parking-ebs-standard
-provisioner: ebs.csi.aws.com
-volumeBindingMode: WaitForFirstConsumer
-reclaimPolicy: Retain
-allowVolumeExpansion: true
-parameters:
-  type: gp3
-  encrypted: "true"
-
----
 apiVersion: v1
 kind: Service
 metadata:
@@ -47,10 +33,13 @@ spec:
       nodeSelector:
         kubernetes.io/arch: amd64
         kubernetes.io/os: linux
+      volumes:
+        - name: data
+          emptyDir:
+            sizeLimit: 2Gi
       containers:
         - name: postgres
           image: postgis/postgis:17-3.5
-          # Initial tuning for a small pilot; revisit after measuring usage.
           args:
             - postgres
             - -c
@@ -95,12 +84,3 @@ spec:
             limits:
               cpu: "1"
               memory: 512Mi
-  volumeClaimTemplates:
-    - metadata:
-        name: data
-      spec:
-        accessModes: ["ReadWriteOnce"]
-        storageClassName: parking-ebs-standard
-        resources:
-          requests:
-            storage: 20Gi
