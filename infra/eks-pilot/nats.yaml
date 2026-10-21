@@ -1,0 +1,81 @@
+spec:
+  clusterIP: None
+  selector:
+    app: parking-nats
+  ports:
+    - name: client
+      port: 4222
+      targetPort: client
+    - name: monitoring
+      port: 8222
+      targetPort: monitoring
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: parking-nats
+  namespace: parking-pilot
+spec:
+  serviceName: nats
+  replicas: 1
+  selector: 
+    matchLabels:
+      app: parking-nats
+  template:
+    metadata:
+      labels:
+        app: parking-nats
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      nodeSelector:
+        kubernetes.io/os: linux
+        kubernetes.io/arch: amd64
+      containers:
+        - name: nats
+          image: nats:2.15.0-alpine
+          args:
+            - "--jetstream"
+            - "--store_dir"
+            - "/data"
+            - "--http_port"
+            - "8222"
+          ports:
+            - name: client
+              containerPort: 4222
+            - name: monitoring
+              containerPort: 8222
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          startupProbe:
+            httpGet:
+              path: /helthz
+              port: monitoring
+            peroidSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /heathz?js-server-only=true
+              port: monitoring
+            peroidSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /helthz
+              port: monitoring
+            peroidSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+      volumes:
+        - name: data
+          emptyDir:
+            sizeLimit: 2Gi

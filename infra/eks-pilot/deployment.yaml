@@ -14,10 +14,22 @@ spec:
         app: parking-api
     spec:
       terminationGracePeriodSeconds: 15
+      automountServiceAccountToken: false
       containers:
         - name: parking-api
           image: 165337436553.dkr.ecr.us-east-1.amazonaws.com/jsp/azario:dev
           imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilites:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
           ports:
             - name: http
               containerPort: 3000
