@@ -1,3 +1,8 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: nats-service
+  namespace: parking-pilot
 spec:
   clusterIP: None
   selector:
