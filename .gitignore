@@ -21,3 +21,7 @@ edge-state.db-*
 /datasets/real-*/
 /evaluation-output/
 /config/edge-camera.toml
+**/*secret*.yaml
+**/*secret*.yml
+!**/*secret*.example.yaml
+!**/*secret*.example.yml

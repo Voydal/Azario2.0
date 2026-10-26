@@ -44,7 +44,7 @@ spec:
             runAsGroup: 10001
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
-            capabilites:
+            capabilities:
               drop:
                 - ALL
             seccompProfile:

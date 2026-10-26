@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: parking-frontend-service
+  namespace: parking-pilot
+spec:
+  selector:
+    app: frontend
+  ports:
+  - port: 8080
+    targetPort: 8080
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: parking-frontend
+  namespace: parking-pilot
+spec:
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      containers:
+      - name: frontend
+        image: nginxinc/nginx-unprivileged:alpine
+        resources:
+          limits:
+            memory: "128Mi"
+            cpu: "500m"
+        ports:
+        - containerPort: 8080

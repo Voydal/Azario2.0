@@ -1,5 +1,7 @@
 FROM rust:1.92-bookworm AS builder
 
+WORKDIR /app
+
 COPY . .
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

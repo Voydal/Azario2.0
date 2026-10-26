@@ -22,7 +22,7 @@ spec:
           args: ["migrate"]
           env:
             - name: DATABASE_URL
-              valueForm:
+              valueFrom:
                 secretKeyRef:
                   name: parking-database
                   key: DATABASE_URL
@@ -40,14 +40,14 @@ spec:
               memory: 128Mi
             limits:
               memory: 256Mi
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 10001
-        runAsGroup: 10001
-        readOnlyRootFilesystem: true
-        allowPrivilegeEscalation: false
-        capabilites:
-          drop:
-            - ALL
-        seccompProfile:
-          type: RuntimeDefault
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
