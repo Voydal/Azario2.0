@@ -61,8 +61,7 @@ spec:
             - name: API_BIND_ADDRESS
               value: "0.0.0.0:3000"
             - name: FRONTEND_ORIGIN
-              # Ustaw rzeczywisty adres frontendu.
-              value: "http://localhost"
+              value: "http://localhost:8080"
             - name: LOG_FORMAT
               value: "json"
             - name: RUST_LOG
