@@ -18,7 +18,7 @@ spec:
       automountServiceAccountToken: false
       containers:
         - name: migrate
-          image: obraz
+          image: ghcr.io/voydal/azario-api:pilot-001
           args: ["migrate"]
           env:
             - name: DATABASE_URL

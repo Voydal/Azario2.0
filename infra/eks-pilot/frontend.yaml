@@ -27,7 +27,7 @@ spec:
     spec:
       containers:
       - name: frontend
-        image: nginxinc/nginx-unprivileged:alpine
+        image: ghcr.io/voydal/azario-web:pilot-001
         resources:
           limits:
             memory: "128Mi"

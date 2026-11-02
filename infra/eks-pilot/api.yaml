@@ -36,7 +36,7 @@ spec:
       automountServiceAccountToken: false
       containers:
         - name: parking-api
-          image: apiImage
+          image: ghcr.io/voydal/azario-api:pilot-001
           imagePullPolicy: IfNotPresent
           securityContext:
             runAsNonRoot: true

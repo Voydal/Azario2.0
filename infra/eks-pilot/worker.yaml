@@ -14,7 +14,7 @@ spec:
     spec:
       containers:
       - name: worker
-        image: workerImage
+        image: ghcr.io/voydal/azario-worker:pilot-001
         resources:
           limits:
             memory: 512Mi
